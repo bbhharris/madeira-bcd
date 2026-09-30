@@ -102,6 +102,8 @@
 
 /* defined at the bottom of this file with the [thread-stacks] dumper */
 static const char *ios_pe_module_name( uint64_t base );
+/* madeira-bcd: for the watchdog's guest-stack dump (server_ios.c). */
+const char *ios_pe_module_name_ext( uint64_t base ) { return ios_pe_module_name( base ); }
 
 WINE_DEFAULT_DEBUG_CHANNEL(seh);
 
@@ -307,6 +309,11 @@ static int ios_srcwatch_handle( const arm_thread_state64_t *st, uintptr_t addr )
 
 static mach_port_t ios_exc_port = MACH_PORT_NULL;
 static int ios_exc_handler_started = 0;
+/* Whether the Mach delivery path classifies ESR alignment faults (see the
+ * [unaligned-atomic] block in ios_mach_deliver_guest_exception_inner). Set
+ * once before the exception server thread starts; MADEIRA_MACH_ALIGN_FAULT=0
+ * turns it off. */
+static int ios_mach_align_fault_enabled = 1;
 static uintptr_t ios_exc_usd = 0;
 volatile int64_t ios_exc_x18_fixes = 0;
 volatile int64_t ios_exc_usd_fixes = 0;
@@ -1364,6 +1371,51 @@ static int ios_fault_read_insn( uint64_t fault_pc, uint32_t *out )
     return 1;
 }
 
+/* madeira-bcd: x18-derived base register.
+ *
+ * Wine's EC kernelbase TlsGetValue is `add x8, x18, w0, uxtw #3;
+ * ldr x0, [x8, #0x1480]`: the TEB address is copied into another register one
+ * instruction before the access, so when iOS has zeroed x18 the fault's base
+ * register is x8, not x18, and the x18 emulation below declined (Crysis
+ * Remastered, JobSystem_Worker_0, 2026-09-30 20:46, build 262: fault at
+ * 0x1570 = TLS slot 30, then the process died). When the instruction right
+ * before the fault is an ADD/MOV that wrote exactly this base register from
+ * x18, the base holds (0 + offset) and fault_addr is the TEB offset, so the
+ * same TEB-relative emulation is correct. Only ADD (extended/shifted register
+ * or immediate) and MOV Xd,X18; the other operand must not be the destination
+ * (it still holds the value the ADD used). */
+static int ios_x18_derived_base( uint64_t fault_pc, int rn )
+{
+    uint32_t p;
+    int rd, pn, pm;
+
+    if (rn == 18 || rn >= 29 || !ios_fault_read_insn( fault_pc - 4, &p )) return 0;
+    /* The x18 patcher (virtual_ios.c, "via x18" form) moves such an ADD into a
+     * trampoline -- `mrs x18, TPIDRRO_EL0; and x18, x18, #~7; ldr x18, [x18,
+     * #slot]; <ADD>; b back` -- and leaves `b tramp` at pc-4. TlsGetValue is
+     * hot enough that a preemption between that ldr and the ADD (iOS zeroes
+     * x18) does happen: build 264 died exactly there again. Follow the branch
+     * when the trampoline has that shape and branches back to the fault. */
+    if ((p & 0xfc000000u) == 0x14000000u)
+    {
+        int64_t imm = (int64_t)(int32_t)((p & 0x03ffffffu) << 6) >> 4;   /* sign-extended imm26 * 4 */
+        uint64_t t = fault_pc - 4 + imm;
+        uint32_t t0, t4;
+        if (!ios_fault_read_insn( t, &t0 ) || t0 != (0xd53bd060u | 18)) return 0;
+        if (!ios_fault_read_insn( t + 16, &t4 ) || (t4 & 0xfc000000u) != 0x14000000u) return 0;
+        if (t + 16 + ((int64_t)(int32_t)((t4 & 0x03ffffffu) << 6) >> 4) != fault_pc) return 0;
+        if (!ios_fault_read_insn( t + 12, &p )) return 0;
+    }
+    rd = p & 31; pn = (p >> 5) & 31; pm = (p >> 16) & 31;
+    if (rd != rn) return 0;
+    if ((p & 0xffe00000u) == 0x8b200000u) return pn == 18 && pm != rd;           /* ADD Xd, X18, Wm/Xm, ext */
+    if ((p & 0xff200000u) == 0x8b000000u) return (pn == 18 && pm != rd) ||       /* ADD Xd, X18, Xm, shift */
+                                                 (pm == 18 && pn != rd && !((p >> 10) & 0x3f));
+    if ((p & 0xff800000u) == 0x91000000u) return pn == 18;                       /* ADD Xd, X18, #imm */
+    if ((p & 0xffffffe0u) == (0xaa0003e0u | (18u << 16))) return 1;              /* MOV Xd, X18 */
+    return 0;
+}
+
 static void *ios_mach_exception_thread( void *arg )
 {
     mach_port_t port = (mach_port_t)(uintptr_t)arg;
@@ -2295,7 +2347,18 @@ static void *ios_mach_exception_thread( void *arg )
                      *  - base reg VALUE vs fault_addr: equal => the register
                      *    literally held the small offset.
                      * Capped at 4 reports so a fault storm can't flood. */
-                    if (rn != 18)
+                    /* madeira-bcd: a base register computed from x18 one instruction earlier */
+                    int x18_derived = ios_x18_derived_base( fault_pc, rn );
+                    if (x18_derived)
+                    {
+                        static int ios_x18_derived_reports;
+                        if (ios_x18_derived_reports++ < 8)
+                            ERR( "[x18-derived] madeira-bcd #%d pc=%p insn=%08x base x%d from x18 -> "
+                                 "TEB+0x%lx emulated\n", ios_x18_derived_reports, (void *)(uintptr_t)fault_pc,
+                                 insn, rn, (unsigned long)fault_addr );
+                    }
+
+                    if (rn != 18 && !x18_derived)
                     {
                         static int ios_x18_decline_reports;
                         if (ios_x18_decline_reports < 4)
@@ -2324,7 +2387,7 @@ static void *ios_mach_exception_thread( void *arg )
                         }
                     }
 
-                    if (rn == 18)
+                    if (rn == 18 || x18_derived)
                     {
                         uintptr_t ea = thread_teb + fault_addr;
                         int rt = insn & 0x1f;
@@ -2621,6 +2684,51 @@ static void *ios_mach_exception_thread( void *arg )
                         }
                     }
 
+                    /* madeira-bcd: ALREADY BACKPATCHED BY A CONCURRENT FAULT.
+                     *
+                     * Two threads running the same block hit the same unaligned
+                     * LDAPR/STLR at once. This handler runs on the one Mach
+                     * exception-server thread, so it rewrites the instruction for
+                     * the first fault and then reads the SECOND thread's fault
+                     * with the plain LDR/STR (LDUR/STUR) already in place -- which
+                     * matches none of the atomic forms below, so the fault went out
+                     * as unhandled and the guest took an access violation on a
+                     * legal unaligned load. God of War's intro video decode threads
+                     * (build 239, logs 2026-09-30 10:49 / 10:51: `ldr x8,[x27,xzr]`,
+                     * `str xzr,[x6,xzr]` at kr=0x101, several threads, same pc).
+                     *
+                     * A plain LDR/STR cannot raise an alignment fault on normal
+                     * memory, so kr == EXC_ARM_DA_ALIGN with one of our rewritten
+                     * forms (and its half-barrier in the neighbouring slot) means the
+                     * fault came from the pre-patch instruction. Re-run it: at pc for
+                     * the loads (barrier after), at pc-4 for the stores (barrier
+                     * before). The patching fault already invalidated the icache. */
+                    if (fault_kr == 0x101 /* EXC_ARM_DA_ALIGN */)
+                    {
+                        uint32_t next_slot = __atomic_load_n((volatile uint32_t *)(rw_pc + 4), __ATOMIC_ACQUIRE);
+                        uint32_t prev_slot_now = __atomic_load_n((volatile uint32_t *)(rw_pc - 4), __ATOMIC_ACQUIRE);
+                        int resume = 0;   /* 1 = at pc, -4 = at pc-4 */
+                        if (((insn & LDAXR_MASK) == LDR_INST || (insn & RCPC2_MASK) == LDUR_INST) && next_slot == DMB_LD)
+                            resume = 1;
+                        else if (((insn & LDAXR_MASK) == STR_INST || (insn & RCPC2_MASK) == STUR_INST) && prev_slot_now == DMB)
+                            resume = -4;
+                        if (resume)
+                        {
+                            static volatile int rp_count;
+                            int n = __sync_add_and_fetch(&rp_count, 1);
+                            if (resume < 0)
+                                __darwin_arm_thread_state64_set_pc_fptr(state, (void *)(uintptr_t)(fault_pc - 4));
+                            if (n <= 16 || (n % 256) == 0)
+                                dprintf(STDERR_FILENO,
+                                        "[mach_exc] UNALIGNED-REPATCHED madeira-bcd #%d pc=0x%llx insn=0x%08x addr=0x%llx "
+                                        "-- rewritten by a concurrent fault, re-run%s\n",
+                                        n, (unsigned long long)fault_pc, insn, (unsigned long long)fault_addr,
+                                        resume < 0 ? " from the barrier" : "");
+                            handled = 1;
+                            goto skip_unaligned_backpatch;
+                        }
+                    }
+
                     if ((insn & LDAXR_MASK) == LDAR_INST ||
                         (insn & LDAXR_MASK) == LDAPR_INST)
                     {
@@ -2828,6 +2936,78 @@ static void *ios_mach_exception_thread( void *arg )
                                         n, (unsigned long long)fault_pc,
                                         (unsigned long long)addr, 1u << Size,
                                         (unsigned long long)cur, (cur & szmask) == cmp);
+                            handled = 1;
+                        }
+                    }
+
+                    /* madeira-bcd: misaligned LSE atomic memory operations.
+                     *
+                     * x86 `lock add/xadd/and/or/xor/xchg` on a misaligned operand is
+                     * legal and FEX lowers it to LDADD/LDCLR/LDEOR/LDSET/SWP (with
+                     * A/L), which alignment-fault here like CAS does. God of War on
+                     * build 241 (logs 2026-09-30 11:20 and 11:21): `ldaddal w7, w8,
+                     * [x6]` on 0x...b6267e, guest 0x1408df521, the frame after the
+                     * intro videos. Emulated like the CAS above: read, compute,
+                     * write through mach_vm on the single exception-server thread,
+                     * old value to Rt, pc + 4. Never patched: the same instruction
+                     * also serves aligned operands. LDAPR shares the family bits
+                     * (o3=1, opc=100) and is left to the backpatch above. */
+                    else if (!handled && (insn & 0x3F200C00u) == 0x38200000u &&
+                             (((insn >> 15) & 1) == 0 || ((insn >> 12) & 7) == 0))
+                    {
+                        uint32_t Size = (insn >> 30) & 0x3;
+                        uint32_t Rs = (insn >> 16) & 0x1F;
+                        uint32_t Rn = (insn >> 5) & 0x1F;
+                        uint32_t Rt = insn & 0x1F;
+                        uint32_t o3 = (insn >> 15) & 1;
+                        uint32_t opc = (insn >> 12) & 7;
+                        uint32_t nbytes = 1u << Size;
+                        uint64_t addr = (Rn == 31) ? __darwin_arm_thread_state64_get_sp(state)
+                                                   : state.__x[Rn];
+                        uint64_t szmask = (Size == 3) ? ~0ULL : ((1ULL << (8u << Size)) - 1);
+                        uint64_t sbit = 1ULL << ((8u << Size) - 1);
+                        uint64_t opnd = ((Rs == 31) ? 0 : state.__x[Rs]) & szmask;
+                        uint64_t cur = 0, nv = 0;
+                        mach_vm_size_t got = 0;
+                        if (mach_vm_read_overwrite( mach_task_self(), addr, nbytes,
+                                                    (mach_vm_address_t)&cur, &got ) == KERN_SUCCESS
+                            && got == nbytes)
+                        {
+                            int64_t sc, so;
+                            cur &= szmask;
+                            sc = (int64_t)((cur ^ sbit) - sbit);
+                            so = (int64_t)((opnd ^ sbit) - sbit);
+                            if (o3) nv = opnd;                                   /* SWP */
+                            else switch (opc)
+                            {
+                            case 0: nv = cur + opnd; break;                      /* LDADD */
+                            case 1: nv = cur & ~opnd; break;                     /* LDCLR */
+                            case 2: nv = cur ^ opnd; break;                      /* LDEOR */
+                            case 3: nv = cur | opnd; break;                      /* LDSET */
+                            case 4: nv = (sc > so) ? cur : opnd; break;          /* LDSMAX */
+                            case 5: nv = (sc < so) ? cur : opnd; break;          /* LDSMIN */
+                            case 6: nv = (cur > opnd) ? cur : opnd; break;       /* LDUMAX */
+                            default: nv = (cur < opnd) ? cur : opnd; break;      /* LDUMIN */
+                            }
+                            nv &= szmask;
+                            if (mach_vm_write( mach_task_self(), addr, (vm_offset_t)(uintptr_t)&nv,
+                                               nbytes ) != KERN_SUCCESS)
+                                goto skip_unaligned_backpatch;  /* write failed: honest AV path */
+                            if (Rt != 31) state.__x[Rt] = cur;
+                            __darwin_arm_thread_state64_set_pc_fptr(
+                                state, (void *)(uintptr_t)(fault_pc + 4));
+                            {
+                                static volatile int lse_count;
+                                int n = __sync_add_and_fetch(&lse_count, 1);
+                                if (n <= 8 || (n % 256) == 0)
+                                    dprintf(STDERR_FILENO,
+                                            "[mach_exc] UNALIGNED-LSE madeira-bcd #%d %s pc=0x%llx addr=0x%llx "
+                                            "size=%u old=0x%llx new=0x%llx\n",
+                                            n, o3 ? "SWP" : (const char *[]){"LDADD","LDCLR","LDEOR","LDSET",
+                                                                              "LDSMAX","LDSMIN","LDUMAX","LDUMIN"}[opc],
+                                            (unsigned long long)fault_pc, (unsigned long long)addr, nbytes,
+                                            (unsigned long long)cur, (unsigned long long)nv);
+                            }
                             handled = 1;
                         }
                     }
@@ -4787,6 +4967,85 @@ skip_reclaim_band: ;
                             (void*)(uintptr_t)state.__x[0], (void*)(uintptr_t)state.__x[2],
                             (void *)thread_teb, peb_p, peb_ecbm);
                     }
+                    /* madeira-bcd [fault-full]: every register, and the host code
+                     * that led up to the faulting instruction (JIT blocks compute
+                     * the address a few instructions earlier), for the first two
+                     * unhandled faults. God of War on build 234 reads 0x40 through
+                     * LDAPR x27,[x6] and the short insn_stream cannot say where x6
+                     * came from. */
+                    /* madeira-bcd [fault-tls]: the thread's TLS[0] block (the main
+                     * image's thread-locals) next to the image's TLS template. God of
+                     * War (build 236) takes its current allocator from TLS[0]+0xc
+                     * (index) / +0xf0 (table) / +0x18 and finds none. */
+                    if (cnt == 1 && thread_teb)
+                    {
+                        uint64_t tlsarr = 0, blk = 0, peb = 0, img = 0;
+                        mach_vm_size_t g = 0;
+                        #define FT_RD(a, v) (mach_vm_read_overwrite(mach_task_self(), (mach_vm_address_t)(a), sizeof(v), \
+                                             (mach_vm_address_t)&(v), &g) == KERN_SUCCESS && g == sizeof(v))
+                        if (FT_RD(thread_teb + 0x58, tlsarr) && tlsarr && FT_RD(tlsarr, blk) && blk)
+                        {
+                            uint64_t q[40];
+                            int i;
+                            if (FT_RD(blk, q))
+                                for (i = 0; i < 40; i += 4)
+                                    dprintf(STDERR_FILENO, "[fault-tls] tls0 %llx+%#x: %016llx %016llx %016llx %016llx\n",
+                                        (unsigned long long)blk, i * 8, (unsigned long long)q[i],
+                                        (unsigned long long)q[i + 1], (unsigned long long)q[i + 2],
+                                        (unsigned long long)q[i + 3]);
+                        }
+                        if (FT_RD(thread_teb + 0x60, peb) && peb && FT_RD(peb + 0x10, img) && img)
+                        {
+                            uint32_t lfanew = 0, tls_rva = 0;
+                            uint64_t dir[6];
+                            if (FT_RD(img + 0x3c, lfanew) && FT_RD(img + lfanew + 0xd0, tls_rva) && tls_rva
+                                && FT_RD(img + tls_rva, dir))
+                            {
+                                uint64_t q[40];
+                                uint32_t idx = 0;
+                                int i;
+                                (void)FT_RD(dir[2], idx);
+                                dprintf(STDERR_FILENO, "[fault-tls] image %llx tls dir: raw %llx-%llx index@%llx=%u callbacks %llx zerofill %llu\n",
+                                    (unsigned long long)img, (unsigned long long)dir[0], (unsigned long long)dir[1],
+                                    (unsigned long long)dir[2], idx, (unsigned long long)dir[3],
+                                    (unsigned long long)(dir[4] & 0xffffffffULL));
+                                if (FT_RD(dir[0], q))
+                                    for (i = 0; i < 40; i += 4)
+                                        dprintf(STDERR_FILENO, "[fault-tls] template +%#x: %016llx %016llx %016llx %016llx\n",
+                                            i * 8, (unsigned long long)q[i], (unsigned long long)q[i + 1],
+                                            (unsigned long long)q[i + 2], (unsigned long long)q[i + 3]);
+                            }
+                        }
+                        #undef FT_RD
+                    }
+                    if (cnt <= 2)
+                    {
+                        int r;
+                        for (r = 0; r < 29; r += 4)
+                            dprintf(STDERR_FILENO, "[fault-full] x%d=%llx x%d=%llx x%d=%llx x%d=%llx\n",
+                                r, (unsigned long long)state.__x[r],
+                                r + 1, (unsigned long long)(r + 1 < 29 ? state.__x[r + 1] : state.__fp),
+                                r + 2, (unsigned long long)(r + 2 < 29 ? state.__x[r + 2] : state.__lr),
+                                r + 3, (unsigned long long)(r + 3 < 29 ? state.__x[r + 3] : state.__sp));
+                        if ((uintptr_t)fault_pc >= 0x100000000ULL + 256)
+                        {
+                            uint32_t hc[68];
+                            mach_vm_size_t got = 0;
+                            if (mach_vm_read_overwrite( mach_task_self(),
+                                                        (mach_vm_address_t)((uintptr_t)fault_pc - 256),
+                                                        sizeof(hc), (mach_vm_address_t)hc, &got ) == KERN_SUCCESS
+                                && got == sizeof(hc))
+                            {
+                                int w;
+                                for (w = 0; w < 68; w += 8)
+                                    dprintf(STDERR_FILENO, "[fault-host] %llx: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+                                        (unsigned long long)((uintptr_t)fault_pc - 256 + w * 4),
+                                        hc[w], hc[w + 1], hc[w + 2], hc[w + 3],
+                                        w + 4 < 68 ? hc[w + 4] : 0, w + 5 < 68 ? hc[w + 5] : 0,
+                                        w + 6 < 68 ? hc[w + 6] : 0, w + 7 < 68 ? hc[w + 7] : 0);
+                            }
+                        }
+                    }
                     /* Read instruction at LR-4 to identify the BL/BLR */
                     if (cnt <= 3 && (uintptr_t)state.__lr >= 0x100000000ULL)
                     {
@@ -5708,6 +5967,59 @@ skip_reclaim_band: ;
                                     (unsigned long long)cr[10], (unsigned long long)cr[11],
                                     (unsigned long long)cr[12], (unsigned long long)cr[13],
                                     (unsigned long long)cr[14], (unsigned long long)cr[15]);
+                                /* madeira-bcd [guest-fn]: the guest code of the two
+                                 * innermost frames, so the faulting function can be
+                                 * disassembled from the log: 48 bytes before each
+                                 * return address, and 256 bytes of the function a
+                                 * direct call (E8 rel32) right before it enters. */
+                                {
+                                    static int guest_fn_dumps;
+                                    int e;
+                                    for (e = 0; e < 2 && guest_fn_dumps < 4; e++)
+                                    {
+                                        uint64_t ret = cr[e * 2];
+                                        uint8_t pre[48];
+                                        mach_vm_size_t gp = 0;
+                                        if (ret < 0x10000 + sizeof(pre) || ret >= 0x800000000000ULL) continue;
+                                        if (mach_vm_read_overwrite(mach_task_self(),
+                                                (mach_vm_address_t)(ret - sizeof(pre)), sizeof(pre),
+                                                (mach_vm_address_t)pre, &gp) != KERN_SUCCESS || gp != sizeof(pre))
+                                            continue;
+                                        guest_fn_dumps++;
+                                        {
+                                            char hex[sizeof(pre) * 2 + 1];
+                                            int b;
+                                            for (b = 0; b < (int)sizeof(pre); b++)
+                                                snprintf(hex + b * 2, 3, "%02x", pre[b]);
+                                            dprintf(STDERR_FILENO, "[guest-fn] [%d] %llx-48: %s\n",
+                                                e, (unsigned long long)ret, hex);
+                                        }
+                                        if (pre[sizeof(pre) - 5] == 0xe8)
+                                        {
+                                            int32_t rel;
+                                            uint64_t tgt;
+                                            uint8_t body[256];
+                                            mach_vm_size_t gb = 0;
+                                            memcpy(&rel, pre + sizeof(pre) - 4, sizeof(rel));
+                                            tgt = ret + (int64_t)rel;
+                                            if (mach_vm_read_overwrite(mach_task_self(),
+                                                    (mach_vm_address_t)tgt, sizeof(body),
+                                                    (mach_vm_address_t)body, &gb) == KERN_SUCCESS
+                                                && gb == sizeof(body))
+                                            {
+                                                char hex[65];
+                                                int off, b;
+                                                for (off = 0; off < (int)sizeof(body); off += 32)
+                                                {
+                                                    for (b = 0; b < 32; b++)
+                                                        snprintf(hex + b * 2, 3, "%02x", body[off + b]);
+                                                    dprintf(STDERR_FILENO, "[guest-fn] [%d] callee %llx+%#x: %s\n",
+                                                        e, (unsigned long long)tgt, off, hex);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -5848,6 +6160,14 @@ static void ios_setup_mach_exception_handler( thread_t pe_thread, uintptr_t teb,
         kr = mach_port_insert_right( mach_task_self(), ios_exc_port, ios_exc_port,
                                       MACH_MSG_TYPE_MAKE_SEND );
         if (kr != KERN_SUCCESS) { ERR("mach exc port insert: kr=%d\n", kr); return; }
+
+        {
+            const char *e = getenv( "MADEIRA_MACH_ALIGN_FAULT" );
+            ios_mach_align_fault_enabled = !(e && e[0] == '0');
+            if (!ios_mach_align_fault_enabled)
+                ERR("[unaligned-atomic] Mach-path alignment classification DISABLED by "
+                    "MADEIRA_MACH_ALIGN_FAULT=0: alignment faults are delivered as c0000005 there\n");
+        }
 
         pthread_t handler;
         pthread_create( &handler, NULL, ios_mach_exception_thread,
@@ -6835,6 +7155,11 @@ static void setup_exception( ucontext_t *sigcontext, EXCEPTION_RECORD *rec )
  *         1 = state rewritten to enter KiUserExceptionDispatcher,
  *         2 = fault serviced by page machinery (guard/watch): plain retry.
  */
+/* Defined further down next to bus_handler (the signal path's user); forward
+ * declared here because the Mach path must run the SAME emulator — see the
+ * [unaligned-atomic] block below for why the two paths may not disagree. */
+static int ios_emulate_unaligned_guest_access(ucontext_t *ctx, uint32_t insn, uintptr_t addr);
+
 static int ios_mach_deliver_guest_exception_inner( thread_t thread, arm_thread_state64_t *state,
                                                    arm_neon_state64_t *neon, int have_neon,
                                                    int exception, uintptr_t fault_addr,
@@ -6858,6 +7183,11 @@ static int ios_mach_deliver_guest_exception_inner( thread_t thread, arm_thread_s
     ucontext_t uc;
     struct __darwin_mcontext64 mc;
     static int deliver_logs;
+    /* 2026-09-19: set when the ESR says this data abort is an ALIGNMENT fault
+     * (DFSC 0b100001). Such a fault is serviceable — it is neither an access
+     * violation nor a transient — so it skips wine's page machinery, the
+     * transient-retry debounce and the redelivery terminal below. */
+    int is_align = 0;
 
     /* Pick the faulting thread's TEB by STACK CONTAINMENT, not by
      * self-consistency alone.
@@ -7115,6 +7445,80 @@ static int ios_mach_deliver_guest_exception_inner( thread_t thread, arm_thread_s
         else rec.ExceptionInformation[0] = EXCEPTION_READ_FAULT;
         rec.ExceptionInformation[1] = fault_addr;
 
+        /* iOS-Madeira 2026-09-19 [unaligned-atomic]: AN ALIGNMENT FAULT IS NOT
+         * AN ACCESS VIOLATION, ON EITHER DELIVERY PATH.
+         *
+         * A 32-bit title froze after its D3D9 device came up with 13 parked
+         * waiters behind one guest critical section. The trigger was a JIT'd
+         * x86 `xchg [mem],reg` — host `swpal w26,w4,[x24]` (0xb8fa8304) at
+         * pool pc 0x138181c94 on guest address ...e32e, i.e. 2 mod 4. x86
+         * permits unaligned atomics; ARM64 LSE atomics fault, and FEX exists
+         * to fix exactly that. The log shows the two paths DISAGREEING about
+         * the same fault, four lines apart:
+         *
+         *   bus_handler  -> esr=0x92000021 -> 80000002 -> FEX: "Handled
+         *                   unaligned atomic: new pc: 138181C98"   (correct)
+         *   this handler -> c0000005 READ 0x710553e32e -> FEX: "Reconstructing
+         *                   context ... eip: 2E3733C0"             (fatal)
+         *
+         * FEX only emulates unaligned LSE atomics, it never back-patches them
+         * (HandleAtomicMemOp returns 4 = skip, no code rewrite), so a guest
+         * spin-acquire re-faults at the SAME host pc on every iteration. Under
+         * the transient-retry debounce below the 1st and 2nd faults declined to
+         * the BSD signal path and were fixed, and the 3rd was dispatched from
+         * here as a bogus access violation — which is not raised at any guest
+         * instruction that can handle it, so the thread unwound out of the
+         * locked region and every later waiter parked forever.
+         *
+         * The ESR already says which it is and nothing else has to be guessed:
+         * EC 0x24/0x25 is a data abort and DFSC (ISS[5:0]) 0b100001 is
+         * "Alignment fault" — the same bits `bus_handler` reads. Plain
+         * loads/stores are emulated in place here exactly as the signal path
+         * does; anything else (LSE atomics, CAS/CASP, exclusives, LDAPR/STLR)
+         * is dispatched as STATUS_DATATYPE_MISALIGNMENT so FEX's unaligned
+         * machinery gets the same shot it gets from bus_handler.
+         *
+         * Safe on this thread: the emulator touches only GPRs of the fabricated
+         * context (it refuses SIMD) and copies bytes through pointers in the
+         * one shared Mach task, and it uses no wine log macros — both required
+         * of anything running on the exception-server thread.
+         *
+         * MADEIRA_MACH_ALIGN_FAULT=0 restores the old classification (every
+         * data abort here is c0000005) for a same-build A/B; it is read once
+         * when the exception server starts, never from this thread. */
+        is_align = ios_mach_align_fault_enabled &&
+                   (esr_ec == 0x24 || esr_ec == 0x25) && (esr & 0x3F) == 0x21;
+        if (is_align)
+        {
+            uint32_t a_insn = 0;
+            mach_vm_size_t got = 0;
+            static unsigned long ua_emu, ua_fex;
+
+            if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)pc,
+                                        sizeof(a_insn), (mach_vm_address_t)&a_insn,
+                                        &got ) == KERN_SUCCESS && got == sizeof(a_insn) &&
+                ios_emulate_unaligned_guest_access( &uc, a_insn, fault_addr ))
+            {
+                PC_sig(&uc) += 4;
+                *state = mc.__ss;
+                if (++ua_emu <= 16 || (ua_emu % 4096) == 0)
+                    dprintf( 2, "[unaligned-atomic] mach-path pc=0x%llx insn=0x%08x addr=0x%llx "
+                                "handled by emulation (plain ld/st) emu=%lu to-fex=%lu rev=2026-09-19\n",
+                             (unsigned long long)pc, a_insn, (unsigned long long)fault_addr,
+                             ua_emu, ua_fex );
+                return 1;
+            }
+
+            rec.ExceptionCode = EXCEPTION_DATATYPE_MISALIGNMENT;
+            rec.NumberParameters = 0;
+            if (++ua_fex <= 32 || (ua_fex % 4096) == 0)
+                dprintf( 2, "[unaligned-atomic] mach-path pc=0x%llx insn=0x%08x addr=0x%llx "
+                            "handed to FEX as 80000002 (was c0000005 before 2026-09-19) "
+                            "emu=%lu to-fex=%lu\n",
+                         (unsigned long long)pc, a_insn, (unsigned long long)fault_addr,
+                         ua_emu, ua_fex );
+        }
+
         /* iOS-Madeira ml613 [av-detail]: THE THREE-WAY DISCRIMINATOR.
          *
          * ml612's fatal AV printed only ExceptionAddress, so read-vs-execute and
@@ -7139,8 +7543,8 @@ static int ios_mach_deliver_guest_exception_inner( thread_t thread, arm_thread_s
          * never block on ios_tail_carve_lock from a fault handler. */
         {
             static unsigned long av_n;
-            unsigned long n = ++av_n;
-            if (n <= 24 || (n % 4096) == 0)
+            unsigned long n = is_align ? 0 : ++av_n;   /* alignment faults are not AVs — see above */
+            if (n && (n <= 24 || (n % 4096) == 0))
             {
                 uint64_t hpc = (uint64_t)arm_thread_state64_get_pc( mc.__ss );
                 unsigned int hinsn = 0;
@@ -7245,18 +7649,25 @@ static int ios_mach_deliver_guest_exception_inner( thread_t thread, arm_thread_s
          * GUARD_PAGE_VIOLATION / STACK_OVERFLOW must be dispatched
          * immediately (wine semantics — state is consistent, no repeat
          * gating). */
-        st = ios_virtual_handle_fault_for_thread( &rec, teb );
-        if (!st)
+        /* An alignment fault has no page to service, and this helper ENDS with
+         * `rec->ExceptionCode = ret` — letting it run would overwrite the
+         * 80000002 chosen above with c0000005 again. It still has to pass the
+         * guest-pc gate below, so no `goto dispatch` here. */
+        if (!is_align)
         {
-            if (deliver_logs < 24)
+            st = ios_virtual_handle_fault_for_thread( &rec, teb );
+            if (!st)
             {
-                deliver_logs++;
-                dprintf( 2, "[mach-deliver] rev=ml369 page-serviced pc=0x%llx addr=0x%llx (guard/watch), retrying\n",
-                         (unsigned long long)pc, (unsigned long long)fault_addr );
+                if (deliver_logs < 24)
+                {
+                    deliver_logs++;
+                    dprintf( 2, "[mach-deliver] rev=ml369 page-serviced pc=0x%llx addr=0x%llx (guard/watch), retrying\n",
+                             (unsigned long long)pc, (unsigned long long)fault_addr );
+                }
+                return 2;
             }
-            return 2;
+            if (st != STATUS_ACCESS_VIOLATION) goto dispatch;
         }
-        if (st != STATUS_ACCESS_VIOLATION) goto dispatch;
     }
 
     /* only claim faults in plausibly GUEST-side execution:
@@ -7277,6 +7688,7 @@ static int ios_mach_deliver_guest_exception_inner( thread_t thread, arm_thread_s
      * the decline regime. Dispatch only on the 3rd identical
      * (thread,pc,addr) fault — still well before the script's 8-stop kill.
      * Single server thread services all messages: no atomics needed. */
+    if (!is_align)
     {
         static struct { uint64_t key; uint32_t n; } rep[16];
         uint64_t key = ((uint64_t)thread << 48) ^ pc ^ ((uint64_t)fault_addr << 1);
@@ -7365,6 +7777,16 @@ dispatch:
      * thread's pointer registers (the ml460 corruption lived at [x10+x9*8]
      * and register dumps were capped away long before the storm settled),
      * then terminate honestly. */
+    /* 2026-09-19: EXEMPT ALIGNMENT FAULTS. The premise of this terminal is "no
+     * legitimate guest pattern redelivers the SAME (thread,pc,addr) thousands
+     * of times" — and the comment above already lists "unaligned" among the
+     * handled retries that "never reach this point". That was true only while
+     * this path mislabelled them c0000005; now that 80000002 is delivered from
+     * here, an unaligned atomic in a guest spin-acquire legitimately redelivers
+     * once per loop iteration (FEX emulates, it cannot back-patch an LSE
+     * atomic), and counting those would kill the pseudo-process for making
+     * progress. */
+    if (!is_align)
     {
         static struct { uint64_t key; uint32_t n; } redeliv[16];
         static volatile int ios_redeliv_terminating;
@@ -13460,6 +13882,66 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher_return,
 /***********************************************************************
  *           __wine_unix_call_dispatcher
  */
+/***********************************************************************
+ *           ios_unixlib_null_call
+ *
+ * Where __wine_unix_call_dispatcher sends a call it cannot make: a NULL
+ * table (a DLL whose __wine_init_unix_call() failed and that called
+ * WINE_UNIX_CALL anyway -- on this port a 32-bit module with no unix side,
+ * which the loader refuses with STATUS_NOT_SUPPORTED), a code past any
+ * builtin's funcs_count, or a NULL entry inside a real table.  Upstream
+ * dereferences the table and the whole pseudo-process dies in the
+ * dispatcher, on a host-side fault no guest handler can see.  Report the
+ * caller once per module and answer STATUS_NOT_IMPLEMENTED, which is what
+ * the caller's own error path already expects from a missing unix side.
+ */
+#define IOS_UNIXLIB_MAX_CODE     0x1000
+#define IOS_UNIXLIB_MAX_CODE_STR "0x1000"
+
+#define IOS_UNIXLIB_NULL_SEEN 32
+static uint64_t ios_unixlib_null_seen[IOS_UNIXLIB_NULL_SEEN];
+static unsigned int ios_unixlib_null_seen_count;
+
+NTSTATUS __attribute__((used)) ios_unixlib_null_call( UINT64 handle, unsigned int code,
+                                                      const void *ret_addr )
+{
+    uint64_t lr = (uint64_t)(uintptr_t)ret_addr, key = 0, rva = 0;
+    const char *name = "?";
+    unsigned int i;
+    Dl_info di;
+    extern uint64_t ios_jit_reverse_translate( uint64_t addr, uint64_t *module_base );
+    uint64_t mod = 0, va;
+
+    if (lr && (va = ios_jit_reverse_translate( lr, &mod )) && mod)
+    {
+        name = ios_pe_module_name( mod );
+        rva  = va - mod;
+        key  = mod;
+    }
+    else if (lr && dladdr( (void *)(uintptr_t)lr, &di ) && di.dli_fbase)
+    {
+        if (di.dli_fname) name = di.dli_fname;
+        rva = lr - (uint64_t)(uintptr_t)di.dli_fbase;
+        key = (uint64_t)(uintptr_t)di.dli_fbase;
+    }
+    else key = lr & ~0xfffull;
+
+    for (i = 0; i < ios_unixlib_null_seen_count && i < IOS_UNIXLIB_NULL_SEEN; i++)
+        if (ios_unixlib_null_seen[i] == key) return STATUS_NOT_IMPLEMENTED;
+    if (ios_unixlib_null_seen_count < IOS_UNIXLIB_NULL_SEEN)
+        ios_unixlib_null_seen[ios_unixlib_null_seen_count++] = key;
+
+    dprintf( STDERR_FILENO,
+             "[unixlib] call with %s from %s+0x%llx code=%u handle=0x%llx -> "
+             "STATUS_NOT_IMPLEMENTED (this module has no unix side on this port; "
+             "further calls from it are silent)\n",
+             !handle ? "NULL handle" :
+             code >= IOS_UNIXLIB_MAX_CODE ? "out-of-range code" : "NULL table entry",
+             name, (unsigned long long)rva, code, (unsigned long long)handle );
+    return STATUS_NOT_IMPLEMENTED;
+}
+
+
 __ASM_GLOBAL_FUNC( __wine_unix_call_dispatcher,
                    "hint 34\n\t" /* bti c */
 #ifdef WINE_IOS
@@ -13501,9 +13983,21 @@ __ASM_GLOBAL_FUNC( __wine_unix_call_dispatcher,
                    __ASM_CFI(".cfi_offset 26, -0x78\n\t")
                    __ASM_CFI(".cfi_offset 27, -0x70\n\t")
                    __ASM_CFI(".cfi_offset 28, -0x68\n\t")
+                   /* Never dereference a unixlib table the PE side never got.
+                    * x0 is the table, x1 the code; a NULL table, a code past
+                    * any builtin's funcs_count, or a NULL entry inside a real
+                    * table all divert to ios_unixlib_null_call(), which logs
+                    * once per caller module and returns STATUS_NOT_IMPLEMENTED.
+                    * Three instructions on the hot path, against a host-side
+                    * fault that killed the whole pseudo-process. */
+                   "cbz x0, " __ASM_LOCAL_LABEL("unixcall_no_table") "\n\t"
+                   "cmp x1, #" IOS_UNIXLIB_MAX_CODE_STR "\n\t"
+                   "b.hs " __ASM_LOCAL_LABEL("unixcall_no_table") "\n\t"
                    "ldr x16, [x0, x1, lsl 3]\n\t"
+                   "cbz x16, " __ASM_LOCAL_LABEL("unixcall_no_table") "\n\t"
                    "mov x0, x2\n\t"             /* args */
-                   "blr x16\n\t"
+                   "blr x16\n"
+                   __ASM_LOCAL_LABEL("unixcall_return") ":\n\t"
                    "ldr w16, [sp, #0x10c]\n\t"  /* frame->restore_flags */
                    "cbnz w16, " __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_return") "\n\t"
                    __ASM_CFI_CFA_IS_AT2(sp, 0x98, 0x02) /* frame->syscall_cfa */
@@ -13521,7 +14015,19 @@ __ASM_GLOBAL_FUNC( __wine_unix_call_dispatcher,
                    "ldp x16, x17, [sp, #0xf8]\n\t"
                    /* switch to user stack */
                    "mov sp, x16\n\t"
-                   "ret x17" )
+                   "ret x17\n"
+
+                   /* No table, no entry, or a code out of range: report it and
+                    * return STATUS_NOT_IMPLEMENTED through the normal epilogue.
+                    * x0/x1 still hold the handle and the code; x30 still holds
+                    * the caller's return address (it was only SAVED to the
+                    * frame above, never overwritten), and clobbering it with
+                    * the `bl` is safe because the return uses x17 loaded from
+                    * the frame, not x30. */
+                   __ASM_LOCAL_LABEL("unixcall_no_table") ":\n\t"
+                   "mov x2, x30\n\t"            /* ret_addr */
+                   "bl " __ASM_NAME("ios_unixlib_null_call") "\n\t"
+                   "b " __ASM_LOCAL_LABEL("unixcall_return") )
 
 #endif  /* __aarch64__ */
 

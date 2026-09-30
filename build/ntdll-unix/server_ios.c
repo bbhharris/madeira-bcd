@@ -413,6 +413,81 @@ static DECLSPEC_NORETURN void server_protocol_perror( const char *err )
 }
 
 
+#ifdef WINE_IOS
+/* A thread killed inside an uninterrupted section leaves the section first.
+ *
+ * When the server kills a thread (TerminateThread, or TerminateProcess ending
+ * the other threads of a process) it closes the thread's request and reply
+ * pipes and sends SIGQUIT. On Linux SIGQUIT is blocked inside
+ * server_enter_uninterrupted_section, so a killed thread always finishes the
+ * section and releases its mutex before it dies. On iOS no signal reaches a
+ * thread (send_thread_signal fails): the killed thread keeps running until a
+ * request finds its pipe closed, and that request is often inside a section:
+ * NtClose, NtDuplicateObject and server_get_unix_fd make theirs holding
+ * fd_cache_mutex. The thread then exited holding the mutex, and every Windows
+ * process here is a thread group in one Mach task sharing that mutex, so every
+ * later NtClose in every process blocked for good. Seen on a device: an
+ * installer's msiexec failed and ended its other threads, one was in its
+ * DLL-detach calls; the program waiting for msiexec then hung in NtClose.
+ *
+ * So inside a section a dead pipe fails the request with
+ * STATUS_THREAD_IS_TERMINATING instead of exiting, later requests fail the same
+ * way without touching the pipes, and the thread exits when it leaves its
+ * outermost section, which is where Linux delivers the SIGQUIT. Outside a
+ * section nothing changes. The depth lives in a pthread key rather than a
+ * _Thread_local, whose first touch on a Darwin thread allocates: entering a
+ * section must not allocate. */
+static pthread_key_t ios_section_key;
+static int ios_section_key_ready;
+
+static void __attribute__((constructor)) ios_section_key_init(void)
+{
+    ios_section_key_ready = !pthread_key_create( &ios_section_key, NULL );
+}
+
+#define IOS_SECTION_DEPTH   0x0fffffffu  /* sections this thread is in */
+#define IOS_SECTION_EXITING 0x20000000u  /* the deferred exit has started */
+#define IOS_SECTION_ABORT   0x40000000u  /* killed: requests fail, exit on leaving */
+
+static inline uintptr_t ios_section_state(void)
+{
+    return ios_section_key_ready ? (uintptr_t)pthread_getspecific( ios_section_key ) : 0;
+}
+
+static inline void ios_section_set_state( uintptr_t state )
+{
+    if (ios_section_key_ready) pthread_setspecific( ios_section_key, (void *)state );
+}
+
+/* A dead pipe on the current thread. TRUE: fail the request, the thread exits when
+ * it leaves its sections. FALSE: exit now (not in a section, or switched off). */
+static BOOL ios_defer_section_abort(void)
+{
+    static int enabled = -1;
+    static int logged;
+    uintptr_t state = ios_section_state();
+
+    if (!(state & IOS_SECTION_DEPTH)) return FALSE;
+    if (enabled < 0)
+    {
+        /* MADEIRA_DEFER_SECTION_ABORT=0: a killed thread exits at once, even inside a section */
+        const char *env = getenv( "MADEIRA_DEFER_SECTION_ABORT" );
+        enabled = !(env && env[0] == '0');
+    }
+    if (!enabled) return FALSE;
+    if (!(state & IOS_SECTION_ABORT))
+    {
+        ios_section_set_state( state | IOS_SECTION_ABORT );
+        if (__sync_fetch_and_add( &logged, 1 ) < 16)
+            dprintf( 2, "[section-abort] tid=%04x killed inside %u uninterrupted section(s); "
+                     "the thread exits when it leaves them\n", (unsigned int)GetCurrentThreadId(),
+                     (unsigned int)(state & IOS_SECTION_DEPTH) );
+    }
+    return TRUE;
+}
+#endif
+
+
 /***********************************************************************
  *           send_request
  *
@@ -473,7 +548,13 @@ static unsigned int send_request( const struct __server_request_info *req )
         }
     }
 
-    if (errno == EPIPE) abort_thread(0);
+    if (errno == EPIPE)
+    {
+#ifdef WINE_IOS
+        if (ios_defer_section_abort()) return STATUS_THREAD_IS_TERMINATING;
+#endif
+        abort_thread(0);
+    }
     if (errno == EFAULT) return STATUS_ACCESS_VIOLATION;
     server_protocol_perror( "write" );
 }
@@ -483,8 +564,9 @@ static unsigned int send_request( const struct __server_request_info *req )
  *           read_reply_data
  *
  * Read data from the reply buffer; helper for wait_reply.
+ * Returns FALSE only when a killed thread's exit is deferred (iOS).
  */
-static void read_reply_data( void *buffer, size_t size )
+static BOOL read_reply_data( void *buffer, size_t size )
 {
     int ret;
 
@@ -492,7 +574,7 @@ static void read_reply_data( void *buffer, size_t size )
     {
         if ((ret = read( ntdll_get_thread_data()->reply_fd, buffer, size )) > 0)
         {
-            if (!(size -= ret)) return;
+            if (!(size -= ret)) return TRUE;
             buffer = (char *)buffer + ret;
             continue;
         }
@@ -514,6 +596,7 @@ static void read_reply_data( void *buffer, size_t size )
 #ifdef WINE_IOS
     /* EOF flavor: the server-side write end of our reply pipe vanished */
     ios_fdt_autopsy( "reply-read-eof", ntdll_get_thread_data()->reply_fd, ret, errno );
+    if (ios_defer_section_abort()) return FALSE;
 #endif
     /* the server closed the connection; time to die... */
     abort_thread(0);
@@ -527,9 +610,10 @@ static void read_reply_data( void *buffer, size_t size )
  */
 static inline unsigned int wait_reply( struct __server_request_info *req )
 {
-    read_reply_data( &req->u.reply, sizeof(req->u.reply) );
-    if (req->u.reply.reply_header.reply_size)
-        read_reply_data( req->reply_data, req->u.reply.reply_header.reply_size );
+    if (!read_reply_data( &req->u.reply, sizeof(req->u.reply) )) return STATUS_THREAD_IS_TERMINATING;
+    if (req->u.reply.reply_header.reply_size &&
+        !read_reply_data( req->reply_data, req->u.reply.reply_header.reply_size ))
+        return STATUS_THREAD_IS_TERMINATING;
     return req->u.reply.reply_header.error;
 }
 
@@ -1760,6 +1844,10 @@ unsigned int server_call_unlocked( void *req_ptr )
     unsigned int ret;
 
     ios_srv_req_count++;
+#ifdef WINE_IOS
+    /* killed inside a section (ios_defer_section_abort): no more requests */
+    if (ios_section_state() & IOS_SECTION_ABORT) return STATUS_THREAD_IS_TERMINATING;
+#endif
     if ((ret = send_request( req ))) return ret;
     /* iOS-Madeira 2026-07-05: kick the in-process server loop out of its
      * tick sleep so the request is picked up in ~50us instead of waiting
@@ -1807,6 +1895,9 @@ void server_enter_uninterrupted_section( pthread_mutex_t *mutex, sigset_t *sigse
 {
     pthread_sigmask( SIG_BLOCK, &server_block_set, sigset );
     mutex_lock( mutex );
+#ifdef WINE_IOS
+    ios_section_set_state( ios_section_state() + 1 );
+#endif
 }
 
 
@@ -1815,8 +1906,21 @@ void server_enter_uninterrupted_section( pthread_mutex_t *mutex, sigset_t *sigse
  */
 void server_leave_uninterrupted_section( pthread_mutex_t *mutex, sigset_t *sigset )
 {
+#ifdef WINE_IOS
+    uintptr_t state = ios_section_state() - 1;
+
+    ios_section_set_state( state );
+#endif
     mutex_unlock( mutex );
     pthread_sigmask( SIG_SETMASK, sigset, NULL );
+#ifdef WINE_IOS
+    /* a request inside the section found this thread killed: exit now that it is out */
+    if (state == IOS_SECTION_ABORT)
+    {
+        ios_section_set_state( IOS_SECTION_ABORT | IOS_SECTION_EXITING );
+        abort_thread( 0 );
+    }
+#endif
 }
 
 
@@ -3932,6 +4036,12 @@ void server_init_process_done(void)
         ios_srv_game_teb = (uintptr_t)NtCurrentTeb();
     }
 
+    /* Opt-in fastsync (wine/dlls/ntdll/unix/sync.c): the handle -> cell cache is
+     * shared by every process of this task and keyed by process id, and the server
+     * reissues the ids of dead processes, so drop what a dead process with this id
+     * left behind. This process owns no handles yet. A no-op while fastsync is off. */
+    madeira_fast_flush_pid();
+
     if (!get_device_info( initial_cwd, &info ) && (info.Characteristics & FILE_REMOVABLE_MEDIA))
         chdir( "/" );
     close( initial_cwd );
@@ -4042,6 +4152,56 @@ void server_init_process_done(void)
                                                   sizeof(frame_x18), (vm_address_t)&frame_x18, &out_size) == KERN_SUCCESS) {
                                 wine_log_write("[Wine WATCHDOG %ds] x18=0 but frame->x[18]=0x%llx (frame=%p)",
                                     secs, (unsigned long long)frame_x18, (void*)frame_ptr);
+                            }
+                        }
+                    }
+                    /* madeira-bcd: WHERE IN THE GUEST it waits. A thread parked in a
+                     * syscall (NtWaitForAlertByThreadId under a lock, build 229: God of
+                     * War inside LdrLoadDll) has its PE caller in the syscall frame
+                     * (TEB+0x378; x29 at +0xe8, lr +0xf0, sp +0xf8, pc +0x100). Walk
+                     * that frame chain and scan the guest stack for return addresses,
+                     * each mapped from the JIT pool copy back to module+offset. */
+                    {
+                        extern uint64_t ios_jit_reverse_translate( uint64_t addr, uint64_t *module_base );
+                        extern const char *ios_pe_module_name_ext( uint64_t base );
+                        uint64_t frame_ptr = 0, regs[4] = { 0, 0, 0, 0 };
+                        vm_size_t got = 0;
+                        if (vm_read_overwrite(mach_task_self(), watchdog_teb_addr + 0x378, sizeof(frame_ptr),
+                                              (vm_address_t)&frame_ptr, &got) == KERN_SUCCESS && frame_ptr &&
+                            vm_read_overwrite(mach_task_self(), frame_ptr + 0xe8, sizeof(regs),
+                                              (vm_address_t)regs, &got) == KERN_SUCCESS)
+                        {
+                            uint64_t fp = regs[0], sp = regs[2];
+                            int n;
+                            const uint64_t pcs[2] = { regs[3], regs[1] };
+                            for (n = 0; n < 2; n++)
+                            {
+                                uint64_t mod = 0, va = ios_jit_reverse_translate( pcs[n], &mod );
+                                wine_log_write("[guest-stk] %s 0x%llx = %s+0x%llx", n ? "lr" : "pc",
+                                    (unsigned long long)pcs[n], va && mod ? ios_pe_module_name_ext( mod ) : "?",
+                                    (unsigned long long)(va && mod ? va - mod : 0));
+                            }
+                            for (n = 0; n < 24 && fp > 0x10000; n++)
+                            {
+                                uint64_t rec[2] = { 0, 0 }, mod = 0, va;
+                                if (vm_read_overwrite(mach_task_self(), fp, sizeof(rec), (vm_address_t)rec, &got) != KERN_SUCCESS)
+                                    break;
+                                va = ios_jit_reverse_translate( rec[1], &mod );
+                                wine_log_write("[guest-stk] fp#%d 0x%llx = %s+0x%llx", n, (unsigned long long)rec[1],
+                                    va && mod ? ios_pe_module_name_ext( mod ) : "?",
+                                    (unsigned long long)(va && mod ? va - mod : 0));
+                                if (rec[0] <= fp) break;
+                                fp = rec[0];
+                            }
+                            for (n = 0; n < 1024 && sp; n++)
+                            {
+                                static int hits;
+                                uint64_t slot = 0, mod = 0, va;
+                                if (vm_read_overwrite(mach_task_self(), sp + 8ull * n, 8, (vm_address_t)&slot, &got) != KERN_SUCCESS)
+                                    break;
+                                if ((va = ios_jit_reverse_translate( slot, &mod )) && mod && va != slot && hits++ < 48)
+                                    wine_log_write("[guest-stk] sp+0x%x 0x%llx = %s+0x%llx", n * 8, (unsigned long long)slot,
+                                        ios_pe_module_name_ext( mod ), (unsigned long long)(va - mod));
                             }
                         }
                     }

@@ -389,6 +389,11 @@ jobs:
             exit 1
           fi
 
+      # Windows thread priorities must not demote USER_INTERACTIVE guest
+      # threads onto the efficiency cores (Crysis's main thread ran there).
+      - name: Patch wineserver thread priorities (keep pthread QoS)
+        run: python3 tools/patch-wine-thread-qos.py
+
       - name: Build base libwineserver.a from wine/server sources
         shell: bash
         run: |
@@ -628,7 +633,7 @@ jobs:
           path: FEX/build-arm64ec
           key: fex-arm64ec-${{ steps.fexrev.outputs.sha }}-v2
 
-      - name: Build xtajit64.dll with the AVX opt-in
+      - name: Build xtajit64.dll (FEX fixes, AVX opt-in)
         if: env.MINGW_OK == '1'
         continue-on-error: true
         run: bash tools/build-xtajit64.sh
@@ -639,6 +644,28 @@ jobs:
         with:
           path: FEX/build-arm64ec
           key: fex-arm64ec-${{ steps.fexrev.outputs.sha }}-v2
+
+      # madeira-bcd: FEX's aarch64 WOW64 module (xtajit.dll, the 32-bit CPU
+      # backend) was only ever built by hand (build/fex-wow64/build.sh). Built
+      # here with the CPUID index fix; on failure the committed module stays.
+      - name: Restore FEX WOW64 build
+        id: fexwowcache
+        uses: actions/cache/restore@v4
+        with:
+          path: FEX/build-wow64
+          key: fex-wow64-${{ steps.fexrev.outputs.sha }}-v1
+
+      - name: Build xtajit.dll (WOW64, CPUID index fix)
+        if: env.MINGW_OK == '1'
+        continue-on-error: true
+        run: bash tools/build-xtajit-wow64.sh
+
+      - name: Save FEX WOW64 build
+        if: steps.fexwowcache.outputs.cache-hit != 'true' && hashFiles('FEX/build-wow64/Bin/libwow64fex.dll') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: FEX/build-wow64
+          key: fex-wow64-${{ steps.fexrev.outputs.sha }}-v1
 
       - name: Restore LLVM 15.0.7 iOS build
         id: llvmcache
@@ -870,6 +897,36 @@ jobs:
       # the patched WMTGeometryEmulationInfo, so this runs before both builds.
       - name: Patch DXMT with DXIL tessellation emulation
         run: python3 tools/patch-dxmt-dxil-tess.py
+
+      # D3D reads past the end of a short constant buffer as 0; Metal reads the
+      # next bytes. Zero-padded copies for such bindings (32-bit Crysis's
+      # D3D10 renderer throws vertices far out without it) and an index-offset
+      # alignment census. Runs before the i386 farm, which is keyed on these
+      # patch scripts.
+      - name: Patch DXMT constant buffers bound short
+        run: python3 tools/patch-dxmt-cb-short.py
+
+      # 16-bit index offsets that are 2 mod 4 get their index range copied to a
+      # 4-byte aligned place (Crysis D3D10 trees; MADEIRA_IDX_REALIGN=0 = off).
+      - name: Patch DXMT to realign 16-bit index ranges
+        run: python3 tools/patch-dxmt-idx-align.py
+
+      # D3D10 reads zero past the end of a vertex buffer; the DXBC vertex fetch
+      # read on into whatever memory followed (32-bit Crysis tree streaks).
+      - name: Patch DXMT vertex fetch bounds
+        run: python3 tools/patch-dxmt-vfetch-bounds.py
+
+      # 32-bit Crysis may bind vertex buffers at offsets that are not 4-aligned;
+      # SM 4.x vertex pulls use byte-aligned loads, and [vb-align] counts them.
+      - name: Patch DXMT byte-aligned vertex fetch
+        run: python3 tools/patch-dxmt-vb-align.py
+
+      # iOS cannot bootstrap-register a shared texture's mach port; without a
+      # port DXMT keeps the texture unshared instead of failing its creation
+      # (Crysis Remastered died on ClearRenderTargetView(NULL) after that).
+      # Native side only, so the i386 farm cache key is not touched.
+      - name: Patch winemetal shared textures for iOS
+        run: python3 tools/patch-winemetal-ios-shared-texture.py
 
       # WoW64's 32-bit Windows farm (app/Madeira/i386-windows), which upstream
       # builds from the pinned wine and DXMT (build/wine-i386) and does not
@@ -1297,6 +1354,24 @@ jobs:
           mkdir -p build-out/Payload
           cp -R build-out/Madeira.xcarchive/Products/Applications/Madeira.app build-out/Payload/
           cd build-out && ditto -c -k --keepParent Payload Madeira-0.1.${{ github.run_number }}-unsigned.ipa
+
+      # Over-the-air install: sign with the owner's certificate (kept in the
+      # owner's PRIVATE Backblaze B2 bucket, never in the repository) and put the
+      # signed IPA plus kurulum.html (7-day pre-signed links) in the same bucket.
+      # Does nothing until the secrets listed in tools/sign-and-publish-ota.sh
+      # exist; never fails the build.
+      - name: Sign for OTA install (private bucket)
+        continue-on-error: true
+        env:
+          B2_KEY_ID: ${{ secrets.B2_KEY_ID }}
+          B2_APP_KEY: ${{ secrets.B2_APP_KEY }}
+          B2_S3_ENDPOINT: ${{ secrets.B2_S3_ENDPOINT }}
+          B2_SIGN_BUCKET: ${{ secrets.B2_SIGN_BUCKET }}
+          SIGN_P12_PASSWORD: ${{ secrets.SIGN_P12_PASSWORD }}
+          OTA_MAIL_USER: ${{ secrets.OTA_MAIL_USER }}
+          OTA_MAIL_APP_PASSWORD: ${{ secrets.OTA_MAIL_APP_PASSWORD }}
+          OTA_MAIL_TO: ${{ secrets.OTA_MAIL_TO }}
+        run: bash tools/sign-and-publish-ota.sh build-out/Madeira-0.1.${{ github.run_number }}-unsigned.ipa ${{ github.run_number }}
 
       # Update packs (tools/pack-index.py): record this build's native ABI in
       # the packs index -- metadata only, the IPA itself is not published --

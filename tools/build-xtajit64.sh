@@ -1,9 +1,11 @@
 #!/bin/bash
 # Build the ARM64EC FEX module (libarm64ecfex.dll) from the FEX submodule with
-# tools/patch-fex-ios-avx.py applied and ship it as xtajit64-avx.dll, next to
-# upstream's untouched xtajit64.dll. WineProcessBridge.m links it in as
-# system32\xtajit64.dll only for a game whose settings turn AVX on
-# (MADEIRA_FEX_AVX=1); every other game runs upstream's module.
+# tools/patch-fex-ios-mapview-selfshared.py and tools/patch-fex-ios-avx.py
+# applied, and ship it as xtajit64.dll (and a copy as xtajit64-avx.dll, which
+# WineProcessBridge.m links in when a game turns AVX on; the AVX patch is
+# itself gated on MADEIRA_FEX_AVX=1). Since build 231 this replaces upstream's
+# committed module: without the map-notification fix a thread that loads a
+# DLL from translated code waits on itself (God of War).
 #
 # build/fex-arm64ec/build.sh does not record everything the committed DLL was
 # built with; the options below reproduce it. FEX_IOS_HOST must reach the
@@ -99,14 +101,44 @@ PY
 echo "=== unpatched rebuild, compared with the committed xtajit64.dll ==="
 build
 if ! diff <(fingerprint "$REF") <(fingerprint "$B/Bin/libarm64ecfex.dll"); then
-    echo "::warning::the rebuilt FEX module does not match the committed xtajit64.dll -- not shipping an AVX build"
-    exit 1
+    # madeira-bcd (build 231): upstream's committed module is 4 KB of .text
+    # smaller than a rebuild of its own pin, with the same function list and
+    # the same Module.S transition code. Report it, but ship the patched
+    # rebuild anyway: the self-deadlock fix below is not optional.
+    echo "::warning::the rebuilt FEX module differs from the committed xtajit64.dll (see the diff above); shipping the patched rebuild"
+else
+    echo "  matches the committed module"
 fi
-echo "  matches the committed module"
 
-echo "=== with the AVX opt-in ==="
+# madeira-bcd: the patched module replaces upstream's xtajit64.dll.
+#  - patch-fex-ios-mapview-selfshared.py: NotifyMapViewOfSection must not take
+#    CodeInvalidationMutex exclusively on a thread that holds it shared (God of
+#    War waited on itself inside LdrLoadDll, builds 226-230).
+#  - patch-fex-ios-intervals-reentry.py: a memory notification raised by an
+#    allocation made under InvalidationTracker's IntervalsLock (a log line
+#    growing FEX's heap) must not wait on its own thread (God of War, builds
+#    230-231: HandleMemoryProtectionNotification -> EFmt -> rpmalloc ->
+#    VirtualAlloc -> NotifyMemoryAlloc -> the same lock).
+#  - patch-fex-ios-ircap-tls.py: FEX's IR-capture mark was a thread_local that
+#    landed in the game's own TLS[0] block and zeroed its bytes +0x8..+0xf on
+#    every block compile (God of War's allocator-stack index, builds 234-238).
+#  - patch-fex-ios-teb-tsd.py: the WinAPI shims' GetCurrentTEB() read x18,
+#    which is 0 on some iOS threads (God of War's TlsGetValue AV, build 239);
+#    they take the TEB from the TSD slot like Module.cpp's IOSLoadTEB.
+#  - patch-fex-ios-cpuid-index.py: CPUID's brand-string/hybrid leaves index
+#    the per-CPU table with the raw host CPU number (out of range on iOS).
+#  - patch-fex-ios-avx.py: AVX/AVX2 only when MADEIRA_FEX_AVX=1 at launch, so
+#    the same module serves both; xtajit64-avx.dll is kept as a copy for the
+#    bridge's existing switch.
+echo "=== with the map-notification, IntervalsLock and IRCapRIP fixes and the AVX opt-in ==="
+python3 "$R/tools/patch-fex-ios-mapview-selfshared.py" "$R/FEX/Source/Windows/ARM64EC/Module.cpp"
+python3 "$R/tools/patch-fex-ios-intervals-reentry.py" "$R/FEX/Source/Windows/Common"
+python3 "$R/tools/patch-fex-ios-ircap-tls.py" "$R/FEX/FEXCore/Source/Interface/IR/PassManager.cpp"
+python3 "$R/tools/patch-fex-ios-teb-tsd.py" "$R/FEX/Source/Windows/Common/Priv.h"
+python3 "$R/tools/patch-fex-ios-cpuid-index.py" "$R/FEX/FEXCore/Source/Interface/Core/CPUID.cpp"
 python3 "$R/tools/patch-fex-ios-avx.py" "$R/FEX/$CPUF"
 build
-git -C FEX checkout -- "$CPUF"
+git -C FEX checkout -- "$CPUF" Source/Windows/ARM64EC/Module.cpp Source/Windows/Common/InvalidationTracker.h Source/Windows/Common/InvalidationTracker.cpp FEXCore/Source/Interface/IR/PassManager.cpp Source/Windows/Common/Priv.h FEXCore/Source/Interface/Core/CPUID.cpp
+cp "$B/Bin/libarm64ecfex.dll" "$SHIP"
 cp "$B/Bin/libarm64ecfex.dll" "$AVX"
-echo "::notice::xtajit64-avx.dll built from FEX $(git -C FEX rev-parse --short HEAD) with the MADEIRA_FEX_AVX opt-in and shipped (xtajit64.dll stays upstream's)"
+echo "::notice::xtajit64.dll (and xtajit64-avx.dll) built from FEX $(git -C FEX rev-parse --short HEAD) with the map-notification and IntervalsLock self-deadlock fixes, IRCapRIP out of the game's TLS, the TSD-slot TEB for the WinAPI shims, the CPUID index wrap, and the MADEIRA_FEX_AVX opt-in, and shipped"

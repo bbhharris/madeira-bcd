@@ -10,6 +10,252 @@ This file is for whoever continues the work (another coding agent or a
 person). Read it first, then `docs/madeira-bcd.md` (every change this fork
 makes, with the reason and the evidence), `docs/WOW64.md`, `docs/BUILDING.md`.
 
+> **MANDATORY FOR EVERY AGENT (Claude, ChatGPT/Codex, anyone) -- owner's
+> order, 2026-09-30.** The owner alternates between assistants. Every change,
+> however small -- code, CI workflow, patch script, submodule pin, config
+> default, build dispatched, device test result, owner decision, secret or
+> account set up -- MUST be written into this file **in the same commit** (or
+> the next one, before handing back to the owner): what changed, why, the
+> evidence (log time / build number), and what is still open. Append; do not
+> rewrite or delete earlier findings. If you only investigated and changed
+> nothing, still note what you found. `AGENTS.md` and `CLAUDE.md` at the
+> repository root repeat this rule. Start with section 0 (latest status).
+
+## 0. Latest status (keep this section current; newest first)
+
+* **2026-09-30 (Claude):** builds 244-252+ -- see "Builds 228-234" section for
+  the full trail. In short:
+  - 32-bit **Crysis** runs (D3D10 via DXMT, ~110 FPS unrecorded on build 249).
+    Fixed: IAT sync, CPUID index, WOW64 TEB (x18), self-suspend (30 s gaps
+    between intro videos), guest main thread QoS (it ran on E-cores only).
+    **Open:** tree/branch geometry streaks in D3D10 (`-dx9` renders correctly
+    but at ~28 FPS). Fixes in flight: zero-padded short constant buffers and
+    realigned 16-bit index ranges -- the first versions skipped GpuManaged
+    buffers and so never ran for static data; the build after 251 covers them
+    and logs `[cb-short] ... encode:` / `[idx-align] ... encode:` counts.
+  - **God of War** reaches the main menu; open issue is memory (jetsam at 8 GB).
+    The owner is tired of regressions: before a risky change, keep the last
+    good build as fallback. After the round-3 upstream merge fastsync is the
+    default sync engine; God of War so far ran on madsync -- set its sync
+    engine to Madsync in its game settings.
+  - **Upstream round 3 merged** (100 commits, Steam library, fastsync default,
+    FEX 26859e1 / wine 4f5b197 / dock 3cadfbe).
+  - Build 254 (merge) failed on nsi_ndis/nsi_ip (HAVE_NET_ROUTE_H, fixed in
+    the next build).
+  - **OTA install** set up (section 2b). ECO toggle is in the in-game Session
+    menu under "CPU" (LibraryHUD in Library.swift).
+  - **Build 256 green** (run 36731040994, head 6e6f4c8, main fast-forwarded):
+    merge + HAVE_NET_ROUTE_H fix + cb-short/idx-align with GpuManaged
+    coverage. First OTA run worked: log 14:59:16 UTC notice "OTA: Madeira
+    0.1.256 signed (profile expires 2027-01-27) ... kurulum-0.1.256.html
+    written to the private bucket (links valid until 2026-10-07 14:59 UTC)".
+    **Waiting on device test:** OTA install from kurulum-0.1.256.html,
+    Crysis D3D10 trees (look for `[idx-align] ... encode: realigned` and
+    `[cb-short] ... encode:` lines), ECO under Session -> CPU, God of War
+    with Madsync (251 is the fallback).
+  - **OTA install confirmed on device** (owner, 2026-09-30 18:27 UTC+3): the
+    kurulum-0.1.256.html -> "Yükle" flow installed build 256 on the first try.
+    The owner is now downloading 64-bit Crysis Remastered (19.4 GB) through the
+    in-app Steam library. Note: 64-bit games use the committed PE d3d11.dll, so
+    the cb-short/idx-align DXMT patches (i386 farm) do not apply to it.
+    (Correction: pushing HANDOFF to main does not start a build -- build-ipa.yml
+    runs on push only when the workflow file itself changes.)
+    (Second correction: the first push of 6e6f4c8 to main DID start run 257,
+    because main's previous head predates workflow changes that 6e6f4c8 carries;
+    run 257 was a duplicate of 256 and is superseded by build 258.)
+  - **Crysis Remastered (64-bit, Steam app 1715130) crash, log 2026-09-30
+    18:42, build 256:** it reaches its window ("Crysis Remastered", 1024x768)
+    and creates 23 DXMT D3D11 devices (FL 11_0), then its RenderThread (tid
+    0108) calls RIP=0 with RCX = a stack pointer (`vkEnumerateInstanceVersion(&v)`
+    shape; the host backtrace's first frame is vulkan-1.dll's base) ->
+    c0000005 -> process exit; the later faults at 0x15a534000 /
+    0x71f5771508 in xtajit64.dll are only fallout of the teardown (the JIT
+    pool of the dead process was reclaimed while its threads ran). Cause: our
+    vulkan-1.dll stand-in (tools/build-stub-dlls.py) returned NULL from
+    vkGetInstanceProcAddr for everything, while the real Khronos loader always
+    returns the global commands even with no driver. **Fix (build 258):** the
+    stand-in now implements vkEnumerateInstanceVersion (1.3), empty instance
+    extension/layer lists, vkCreateInstance -> VK_ERROR_INCOMPATIBLE_DRIVER,
+    and vkGetInstanceProcAddr returns those five global commands (NULL for the
+    rest), with real C prototypes so the arm64ec entry thunks pass arguments.
+    Checked locally: the generated C compiles for arm64ec. Open: device test;
+    if it still dies, look for the next NULL call in the same place.
+  - **Build 258 green** (run 36739501697, head ab18526, main fast-forwarded):
+    "vulkan-1.dll stand-in built (262 exports) and shipped"; OTA notice
+    "Madeira 0.1.258 signed ... kurulum-0.1.258.html written to the private
+    bucket (links valid until 2026-10-07 16:07 UTC)". Waiting on the owner's
+    Crysis Remastered retry log.
+  - **Owner, 2026-09-30 ~19:30 UTC+3, build 256:** 32-bit Crysis D3D10 tree
+    streaks exactly as before -- the cb-short and idx-align fixes (now covering
+    GpuManaged buffers) changed nothing visible (the log of that run has not
+    been sent yet; ask for it to see whether their `encode:` counters fired).
+    God of War: unchanged by the upstream merge, still dies of memory a
+    little into play; the owner has not tried the memory swap setting yet.
+  - **New lead for the tree streaks (build 259):** airconv's DXBC vertex fetch
+    (dxbc_converter_basicblock.cpp) pulls attributes from base + stride*index
+    with no bound, although the table entry carries the binding's length;
+    the D3D9 path (dxso_compile.cpp, upstream) clamps to it -- and `-dx9`
+    renders the trees correctly. D3D10 defines an out-of-range fetch as zero;
+    Metal reads on. tools/patch-dxmt-vfetch-bounds.py (new, step "Patch DXMT
+    vertex fetch bounds") routes a DXBC fetch at/past the length to the
+    existing null-binding branch (zeros), logs `[vfetch-bounds] ... on` once,
+    `MADEIRA_VFETCH_BOUNDS=0` turns it off, and bumps kDXMTShaderCacheVersion
+    15 -> 16 so already-converted shaders are converted again (32-bit farm
+    only; the committed 64-bit PE d3d11.dll keeps 15). airconv is native
+    (dxmt-ios), so this reaches 64-bit D3D11 games too (see the correction
+    below: God of War is D3D11; limited to SM 4.x shaders in build 260). Not compiled locally (no LLVM 15 headers here): CI is the check.
+  - **OTA link by e-mail** (section 2b): owner asked for Google Drive instead of
+    the B2 login; Drive cannot host an OTA install, so CI now e-mails the
+    install page's pre-signed link when the OTA_MAIL_* secrets exist (added
+    after build 259 was dispatched, so it rides the next build). Open: owner
+    creates the app password and the three secrets.
+  - **Log 2026-09-30 19:01 (named GoW.exe, build 256) is God of War, not the
+    Crysis D3D10 run** (still missing): GoW reached the main menu on fastsync
+    (inproc-sync unset -- Madsync was NOT selected) and idled there 18 min
+    without dying. Memory at the menu: phys footprint ~7.7 GB (internal 4.1 GB
+    + 2.35 GB compressed + 0.5 GB external), flat for the whole idle -- no
+    leak at idle, but the menu alone sits just under the limit, so any
+    gameplay allocation tips it over. DXMT census at the menu: METAL
+    currentAllocatedSize 1.5 GB (tex-private 579 MB, buffers 793 MB), so most
+    of the footprint is not GPU resources. **Correction:** God of War runs
+    D3D11 through DXMT (mem-census), not D3D12 -- so the vertex-fetch-bounds
+    change in airconv would have reached it. The patch now applies by default
+    only to SM 4.x (D3D10-era) vertex shaders; GoW's SM 5.0 shaders convert
+    exactly as before (MADEIRA_VFETCH_BOUNDS=1 all, =0 none). Build 259 (all
+    shaders) was superseded by build 260 with this.
+  - **Owner, 2026-09-30 evening:** will set up the Gmail app password and the
+    OTA_MAIL_* secrets in the morning, and wants to "delete Backblaze from the
+    workflow" once mail works. Told the owner: the e-mail only replaces the B2
+    *login*; the IPA, manifest and signing files still live in the private B2
+    bucket and the mailed link points there. Removing B2 needs another private
+    store with expiring direct HTTPS links -- Google Cloud Storage (signed
+    URLs; Google Cloud, not Drive) could replace it. **Owner's decision
+    (2026-09-30 evening): keep Backblaze + the Gmail e-mail** (no migration);
+    the owner adds the OTA_MAIL_* secrets in the morning from a PC. Do not
+    remove B2.
+  - **Crysis Remastered, log 2026-09-30 19:29, build 258:** the vulkan-1 fix
+    worked -- the game starts, shows its menu, "New game" loads to 100 %, then
+    dies. Before it: 15 x "DeviceTexture: Failed to register mach port for
+    shared texture" (CreateTexture2D with a SHARED flag -> E_FAIL, because
+    WMTBootstrapRegister/bootstrap_register2 is refused to an iOS app). Then
+    RenderThread (tid 0110) reads address 0 in d3d11.dll rva 0x885ac =
+    `MTLD3D11DeviceContextImplBase::ClearRenderTargetView` with a NULL view
+    (the committed arm64ec d3d11.dll has symbols; `llvm-objdump -d` it). Level
+    load memory: DXMT tex-private 4.5 GB, METAL currentAllocatedSize 1.9 GB.
+    **Fix (next build):** tools/patch-winemetal-ios-shared-texture.py (native
+    winemetal_unix.c, so it reaches the committed 64-bit PE too): on iOS a
+    new shared texture gets no mach port, which DXMT's existing ml866 fallback
+    turns into an unshared texture and S_OK. `[shared-tex]` logs the first 4;
+    MADEIRA_SHARED_TEXTURE_PORT=1 restores the old path. God of War creates no
+    shared textures (none in its 19:01 log). The null-RTV clear itself would
+    still crash if it came from elsewhere (DXVK ignores a NULL view; DXMT's
+    64-bit PE is a committed upstream binary, so that guard needs a PE rebuild).
+  - Build 260 (5e90d18) was superseded early by build 261 (74ad830: vfetch
+    bounds for SM 4.x + shared textures without mach port + OTA e-mail).
+  - **Steam games' session logs (owner's request, 2026-09-30; not yet built --
+    the owner said to hold it for the next build):** games started with the
+    Steam licence (Madeira Dock: explorer.exe first, Valve's client picks the
+    program) got no `Documents/logs/<exe>-<stamp>.txt`, because only the
+    app's own launch paths call LogStore.startSessionLog. Now
+    `madeira_steam_session_log` in build/ntdll-unix/process_ios.c
+    (NtCreateUserProcess, after the spawn phase stamp) hard-links
+    madeira-log.txt as `logs/<exe>-<local time>.txt` when a process under
+    `steamapps\common\` starts (once per exe name; skips names containing
+    fxc/redist/dxsetup/crash/setup/install -- Crysis Remastered spawns
+    fxc.exe) and logs `[session-log] ... Steam game <exe>: logs/...`.
+    Unit-tested on Linux in isolation (link made, fxc/duplicate/system exe
+    skipped); ntdll-unix build on CI is the real check.
+  - Owner asked (2026-09-30 night, B2 web keeps logging out) for the install
+    links in chat until the mail is set up. Not possible by design: agents hold
+    no B2 credentials (the key lives only in GitHub secrets; the one pasted in
+    chat must not be used), and CI cannot hand the link over through the public
+    Actions log. Pointed the owner to setting up the OTA_MAIL_* secrets from the
+    phone (app password page + GitHub website in Safari) instead.
+  - **Build 261 green** (run 36745357839, head 74ad830): all patch steps ran
+    (vfetch bounds, winemetal shared textures), i386 farm rebuilt and saved,
+    OTA notice "Madeira 0.1.261 signed ... kurulum-0.1.261.html ... valid until
+    2026-10-07 17:04 UTC". Mail: "no OTA_MAIL_* secrets" -- the owner added
+    them after the step ran. Build 262 (29c32ad: + Steam-game session logs)
+    dispatched ~17:12 UTC as the first build with the secrets.
+    (Correction to an earlier chat reply: 261 already contained the mail code;
+    only the secrets were missing.)
+  - **Build 262 green** (run 36749588085, head 29c32ad; main fast-forwarded,
+    the duplicate push run 263 on main cancelled): Steam-game session logs,
+    shared textures, vfetch bounds. **First e-mail went out**: log 17:29:06
+    "OTA: install link for 0.1.262 e-mailed to the owner". Same log showed
+    `aws: [ERROR] ... Unknown options: --only-show-errors` -- `aws s3 ls` does
+    not take that flag, so the keep-the-last-10 cleanup silently never ran
+    (builds 256-262 all still in the bucket). Fixed in sign-and-publish-ota.sh
+    (plain `aws s3 ls --endpoint-url`); takes effect with the next build.
+  - **Owner, build 262 (log CrysisRemastered.exe-2026-09-30_20-43-04.txt):** the
+    mail arrived and worked; the Steam session log was named by exe (the new
+    `[session-log]` line); `[shared-tex]` fired 4x and the game now gets past
+    the load -- then dies "a few seconds later". Cause: JobSystem_Worker_0
+    (tid 00a8) in kernelbase.dll rva 0x6d358 = **TlsGetValue** (`add x8, x18,
+    w0, uxtw #3; ldr x0, [x8, #0x1480]`) with x18 == 0 (iOS zeroes x18):
+    fault at 0x1570 (TLS slot 30). The mach handler's x18 emulation only
+    handled Rn == 18 and printed `[x18-decline]`, so the AV killed the process
+    (the xtajit64 faults after it are teardown fallout, as before). **Fix
+    (next build):** `ios_x18_derived_base` in build/ntdll-unix/signal_arm64_ios.c
+    -- when the instruction right before the fault is ADD (ext/shifted reg,
+    imm) or MOV that wrote the faulting base register from x18, the fault
+    address is the TEB offset and the existing TEB-relative emulation runs
+    (logged `[x18-derived]`, first 8). Only a previously fatal path changes.
+    Crysis Remastered memory at that point: footprint 4.8 GB.
+  - **32-bit Crysis D3D10, build 262 (log Crysis.exe-2026-09-30_21-09-08.txt,
+    2.5 min, no crash, footprint ~3 GB):** all three tree fixes fire --
+    `[vfetch-bounds] ... on for SM 4.x vertex shaders` + bounded attributes,
+    `[idx-align] ... encode: realigned`, `[cb-short] ... encode: zero-padded
+    copy bound` (e.g. cb0 declared 80 vec4, bound 74). The owner has not yet
+    said whether the trees still streak; asked. **Owner: unchanged, no
+    improvement at all.**
+  - **Build 264 green** (run 36755719496, head 88e1d6d, main fast-forwarded):
+    x18-derived emulation; OTA mailed ("install link for 0.1.264 e-mailed"),
+    the aws cleanup error is gone (8 builds in the bucket, nothing to delete).
+  - **Next tree lead (build 265):** Crysis packs index data at 2-byte
+    granularity; if its vertex buffers are bound at offsets/strides that are
+    not multiples of 4, airconv's attribute loads (which claim natural
+    alignment, 4 bytes for floats) read from rounded-down addresses on the
+    GPU. tools/patch-dxmt-vb-align.py (new): SM 4.x vertex attribute pulls use
+    alignment-1 loads (thread_local `madeira_vfetch_align1` set around the
+    pull in pull_vertex_input, honoured in load_from_device_buffer;
+    MADEIRA_VFETCH_ALIGN1=0 off, =1 all shaders; `[vfetch-align]` once);
+    PE-side census `[vb-align]` of IASetVertexBuffers offsets/strides not
+    4-aligned; shader cache version 16 -> 17. God of War (SM 5.0) unchanged.
+    If `[vb-align]` stays silent, the theory is dead and this change is inert.
+  - **Crysis Remastered, build 264 (log CrysisRemastered.exe-2026-09-30_21-19-06):**
+    got further -- the owner saw the rendered scene for 5-6 s for the first
+    time -- then the SAME TlsGetValue fault (pc pool+..358, addr 0x1570, x18=0,
+    tid 00a8 "Main" this time) and `[x18-decline]`: the `[x18-derived]` path
+    never fired, because the x18 patcher (virtual_ios.c, "via x18" form) had
+    moved the `add x8, x18, w0, uxtw #3` into a trampoline (`mrs x18,
+    TPIDRRO_EL0; and; ldr x18,[x18,#slot]; add; b back`), leaving `b tramp` at
+    pc-4. TlsGetValue is hot enough that a preemption between the trampoline's
+    ldr and its add (iOS zeroes x18) happens within seconds. **Fix (build 266):**
+    ios_x18_derived_base follows a `b` at pc-4 when its target has exactly
+    that trampoline shape and branches back to the fault, and checks the ADD
+    inside it (unit-tested with the logged words: rn 8 -> derived, rn 9 -> not).
+    Build 265 (vb-align) was superseded by 266 (vb-align + this).
+  - **Build 266 green** (run 36758343731, head 72517a8; main fast-forwarded):
+    i386 farm rebuilt with the [vb-align] census (725 files, exit 0, cached),
+    all patch steps applied, OTA mailed ("install link for 0.1.266 e-mailed").
+    Waiting on the owner: Crysis Remastered ([x18-derived]) and 32-bit Crysis
+    D3D10 trees ([vfetch-align], [vb-align]).
+  - **Crysis Remastered RUNS on build 266** (owner, 2026-09-30 ~22:12-22:35
+    UTC+3, four logs, "harika çalışıyor"): `[x18-derived] ... base x8 from x18
+    -> TEB+0x1490 emulated` fired 7x in the long run (6 min, no crash); none of
+    the four logs has an access-violation exit. Open: **MetalFX upscaling did
+    not engage** -- no MetalFX line in any log. Cause: a Steam game started
+    with the Steam licence goes launchLibraryEntry -> startDock and returned
+    before BCDLaunch.applyLibrary, so MADEIRA_CFG_GAME, DXMT_METALFX_SPATIAL_
+    SWAPCHAIN / d3d11.metalSpatialUpscaleFactor, AVX, wine-vcrt and NVIDIA
+    were never set for Steam games. **Fix (next build):** the Steam branch
+    calls `BCDLaunch.applyLibrary(entry, sessionLog: false)` before startDock
+    (the native side already names that session log after the exe); the
+    `[bcd] library launch` line now also prints `metalfx=`. The committed
+    64-bit d3d11.dll does contain DXMT's MetalFX spatial swapchain strings.
+    Not compiled here (no Swift toolchain); CI is the check.
+
 ---
 
 ## 1. What this repository is
@@ -93,6 +339,43 @@ is re-upstreaming them as `pr/fastsync-opt-in`, `pr/async-apc-requeue`,
   main. Since build 222 upstream's side (and its submodule pins) wins where it
   replaced something we carried.
 
+## 2b. Over-the-air install (owner's decision 2026-09-30)
+
+* CI step "Sign for OTA install (private bucket)" runs
+  `tools/sign-and-publish-ota.sh` after the unsigned IPA is packaged
+  (continue-on-error; skips itself when a secret is missing).
+* The owner's signing files live ONLY in the owner's **private** Backblaze B2
+  bucket `Github-BCD` (root: `Development.p12`, `Development.mobileprovision`).
+  Repository secrets: `B2_KEY_ID` (the keyID, not the key name), `B2_APP_KEY`,
+  `B2_S3_ENDPOINT` (`s3.eu-central-003.backblazeb2.com`), `B2_SIGN_BUCKET`
+  (`Github-BCD`), `SIGN_P12_PASSWORD`. The key is limited to that bucket.
+* Output: `ota/Madeira-<ver>.ipa` + `ota/manifest-<ver>.plist` (last 10 kept;
+  the cleanup only works from the build after 262, see section 0)
+  and `kurulum-<ver>.html` at the bucket root with a "Yükle" button (owner
+  asked for the version in the name, 2026-09-30; the last 10 are kept); links
+  are 7-day pre-signed URLs. The owner opens the newest `kurulum-<ver>.html`
+  from the B2 panel/app; tapping "Yükle" makes the iPhone download
+  `ota/Madeira-<ver>.ipa` straight from the same private bucket.
+* **Nothing is public:** the repo and its Actions logs are public, so the
+  script never prints a URL or key. A public/unlisted bucket was refused by the
+  session's safety check (the IPA contains Apple's converter library and the
+  owner's device-bound profile) -- do not reintroduce it.
+* **E-mail delivery (added 2026-09-30, owner found the B2 login tedious and
+  asked about Google Drive):** Drive cannot serve the OTA itself -- iOS's
+  installer fetches the manifest/IPA without any login, so a Drive file would
+  have to be shared publicly (refused above), and Drive answers large files
+  (>100 MB) with an HTML virus-scan page instead of the bytes. Instead, when
+  the secrets `OTA_MAIL_USER` (sending Gmail/Workspace address),
+  `OTA_MAIL_APP_PASSWORD` (an app password, not the account password) and
+  `OTA_MAIL_TO` exist, the script e-mails the owner a 7-day pre-signed link to
+  `kurulum-<ver>.html` (smtp.gmail.com:587, STARTTLS); it opens in Safari with
+  no login, "Yükle" installs. The address stays in secrets (public repo); the
+  log only says "install link ... e-mailed". A mail failure is a warning only.
+* Signing keeps the IPA's own bundle ids (`com.willfaust.mythicemu`, extension
+  `.MemoryHost`), like the owner's Feather install, so an OTA install updates
+  the installed app in place. `SIGN_USE_PROFILE_BUNDLE_ID=1` would rename to
+  the profile's App ID instead.
+
 ## 3. Hard rules (do not break)
 
 * **Never commit Microsoft VC++ runtime DLLs** (`app/Madeira/x86_64-vcruntime/*.dll`
@@ -111,8 +394,10 @@ is re-upstreaming them as `pr/fastsync-opt-in`, `pr/async-apc-requeue`,
   emulator). Fix Madeira-side bugs only; **do not help configure crack or
   Steam-emulator files** (e.g. `steam_api.ini`).
 * A GitHub PAT was once pasted in chat; the owner was told to revoke it. Never
-  use tokens from chat. A signing `.p12` (+password) and `.mobileprovision`
-  were shared read-only; never commit or use them.
+  use tokens from chat. The signing `.p12` (+password) and `.mobileprovision`
+  must never be committed or printed. Since 2026-09-30 (owner's decision) CI
+  uses them only from the private B2 bucket for OTA signing (section 2b);
+  agents do not handle the files themselves.
 
 ## 4. Ghost of Tsushima (D3D12, Nixxes port) -- PAUSED 2026-09-29
 
@@ -681,6 +966,274 @@ tracked DLL and stay green).
 * The unix DXBC cache (`Documents/shadercache/*.mdsc`) got a fresh set per
   build and never lost the old ones; entries of earlier builds are removed
   once per build (log: `DXBC shader cache: removed N entries`).
+
+### Builds 228-234: God of War hangs at start (presents 0), 2026-09-29/30
+Tried and ruled out one by one on the device (each a separate build): madsync
+off, 125hz's early JIT pool (6c944a6: upstream's placement again),
+swap-min-kb, 125hz's decommit_pages (0046bce). Upstream's own build of the
+same game was never tested here.
+* Build 230 (2f8a0f4): the 2 s watchdog prints `[guest-stk]` lines for a
+  thread parked in a syscall (TEB+0x378 syscall frame, fp chain, stack scan,
+  JIT addresses reverse-mapped to module+offset). FEX offsets are symbolized
+  with `llvm-nm -n -C` of the SHIPPED xtajit64.dll (RVA = addr - 0x180000000);
+  since build 231 the shipped module is a CI rebuild, so the committed DLL's
+  symbols are off by a few hundred bytes after Module.cpp.
+* Build 231 (3705656, tools/patch-fex-ios-mapview-selfshared.py): guessed a
+  self-wait on CodeInvalidationMutex in NotifyMapViewOfSection. Its log line
+  (`[img-map] madeira-bcd`) never appeared; still hangs. The patch is kept
+  (harmless).
+* The build 230 stack, symbolized properly, is a self-wait on
+  InvalidationTracker::IntervalsLock (std::shared_mutex, not recursive):
+  HandleMemoryProtectionNotification holds it and logs `[iOS-xrem]` -> the
+  log line grows FEX's heap (rpmalloc heap_get_page_generic) -> VirtualAlloc
+  -> NotifyMemoryAlloc -> HandleMemoryProtectionNotification -> the same
+  lock. Build 234 (840d90f, tools/patch-fex-ios-intervals-reentry.py; run 233
+  was cancelled by mistake): the
+  lock remembers its exclusive owner (TPIDRRO_EL0 on iOS); the memory
+  notifications return at once on that thread and are counted
+  (`[iv-reentry]` from HandleImageMap). Device test pending; then madsync and
+  swap-min-kb back on for GoW one at a time.
+* Build 234 on the device (logs 2026-09-30 08:57 and 08:58): the hang is
+  gone. GoW now gets past imm32, loads concrt140/vcruntime140_1, starts its
+  job-manager threads, initialises d3d11/dxgi (video budget, the 1368 MB and
+  1026 MB reservations) and then faults the same way both times: guest code
+  reads 0x40 (host LDAPR x27,[x6], x6 = 0x40; State.RIP 0x14002c4e0, callret
+  [0] 0x14017d7a2, [1] 0x14002c4f0), host sp 0x71fe3c0000. The pre-switch
+  build (125hz, log 2026-09-29 13:48) passes the same point: the exe was
+  relocated to 0x15f210000 there, the 2 MB commit in the 1026 MB reservation
+  was swap-backed (swap-min-kb), and crs-client.dll loaded next. Build 236
+  logs every register, 256 bytes of host code before the fault
+  ([fault-full], [fault-host]) and the guest bytes of the two innermost
+  frames and their direct-call targets ([guest-fn]).
+* Build 236 (log 2026-09-30 09:28) names it. A static constructor
+  (0x14002c4e0, from the CRT's initterm at 0x140664xxx) builds a global at
+  0x1427d27f0 with ctor 0x14017d750, which allocates 0x1000 bytes through
+  the thread's current allocator: GoW.exe's own TLS block (TLS[0]) holds an
+  index at +0xc and a table at +0xf0; the index is negative or the entry is
+  0, so the allocator is NULL. 0x14040bf10 then finds TLS[0]+0x18 == 0 too
+  (the other path) and reads NULL->0x40. The TLS setup order is identical
+  in the pre-switch log that passes this point, so an earlier initializer
+  took another path. Only visible difference at that point: the 2 MB commit
+  at the start of the 1026 MB reservation was swap-backed there
+  (swap-min-kb 1024) and is plain memory now. Next test: swap-min-kb = 1024
+  back in GoW's config.
+  Tested (log 09:32, build 236 with swap-min-kb = 1024): the commit is
+  swap-backed again and the fault is unchanged -- not the swap tier. Build
+  237 prints the thread's TLS[0] block and the image's TLS template at the
+  first unhandled fault ([fault-tls]).
+* Build 237 (log 09:53): GoW.exe's TLS template has the allocator-stack
+  index at +0xc = -1 (empty); the main thread's block has +0xc = 0 and the
+  table at +0xf0 holds [0] = 0, [1] = 0x7158890000 (the 1026 MB arena from
+  jumbo#2). So the arena was pushed one slot too high, or something pushed
+  NULL first, or +0xc was reset to 0 before the push (a 64-bit store to +0x8
+  would do that). Other changes vs the template: +0x28 = 0x14506ce60,
+  +0x58 low dword 0x80000000 -> 0x80000005. Finding the writers needs the
+  code: GoW.exe itself (the owner's copy, analysis only, never committed).
+* GoW.exe (owner's copy, kept out of the repo) disassembled: the allocator
+  stack is push `idx = movsxd [tls+0xc]; [tls+0xc] = idx+1;
+  [tls+0xf0 + 8*idx + 8] = heap` (14 inlined sites, e.g. 0x14040a8f0),
+  pop `[tls+0xc] = idx-1`, and one restore (0x14040b2f0) that zeroes the
+  table above the restored count; nothing else stores into the table. The
+  memory init at 0x14040a8a3 pushes heap A (an object in .data at
+  0x1426d18b0 + n*0x238, never NULL) right after the 1368 MB VirtualAlloc,
+  then the 1026 MB arena (0x14040aa2f -> 0x1404ad5c0), then pops once. The
+  observed state (index 0, table[0] 0, table[1] arena) is what you get if the
+  first push, the one with index -1, never reached table[0]. No module has an
+  unslotted static TLS (checked every DLL the log loads). Build 238 prints
+  the stack at each of the first four jumbo reservations ([jumbo-tls]):
+  jumbo#1 is heap A's VirtualAlloc (before the push), jumbo#2 the arena
+  (after it).
+* Build 238 (log 10:28): [jumbo-tls] #1 (before the game's first push)
+  already reads index 0, and #2 (right after the push of heap A into
+  table[1]) reads index 0 again; the arena push then overwrote A. So
+  something outside the game zeroes TLS[0]+0x8..+0xf. It is FEX:
+  xtajit64's own TLS template (0x30 bytes) holds `thread_local IRCapRIP`
+  (PassManager.cpp, ml623 IR capture) at offset 8, Core.cpp clears it at the
+  start of every block compile, and in the ARM64EC module that implicit-TLS
+  access lands in the executable's TLS[0] block (implicit TLS is banned in
+  xtajit64 for this reason; the WOW64 module already uses an atomic). Build
+  239: tools/patch-fex-ios-ircap-tls.py makes it an atomic in the ARM64EC
+  module as well. The other xtajit64 thread_local (AllocWatch's Anchor, +0x10)
+  only has its address taken.
+* Build 239 on the device (logs 10:49, 10:50, 10:51): past the allocator
+  fault; Metal HUD up, the Sony Interactive Entertainment intro video plays
+  for about a second, then it stops. Two of three runs: the unaligned
+  backpatch race. Several video/decode threads run the same block; the Mach
+  exception server rewrites LDAPR/STLR -> LDR/STR (+ half-barrier) for the
+  first fault, then reads the next thread's (already queued) alignment fault
+  with the plain form in place, matches nothing and sends it on as unhandled
+  (`ldr x8,[x27,xzr]` / `str xzr,[x6,xzr]`, kr=0x101, same pc, x18 differs).
+  Build 240: kr == EXC_ARM_DA_ALIGN on a rewritten form whose barrier slot is
+  in place is re-run (pc for loads, pc-4 for stores) ([mach_exc]
+  UNALIGNED-REPATCHED). Third run: FEX native code with x18 = 0 read
+  TEB->TlsSlots[1] (addr 0x1488, pc libarm64ecfex+0x12f908) -- the iOS x18
+  problem in FEX's TlsGetValue shim (Source/Windows/Common/WinAPI/Alloc.cpp,
+  GetCurrentTEB() = NtCurrentTeb() = x18). Build 241 (240 superseded while
+  running): tools/patch-fex-ios-teb-tsd.py makes the ARM64EC module's
+  GetCurrentTEB() read the TEB from the TSD slot (TPIDRRO_EL0 +
+  IosTebTsdOffset, as IOSLoadTEB does), x18 only as the fallback.
+* Crysis64 (log 2026-09-30 11:05, build 239): the same fault as every run
+  since 2026-09-26: CrySystem.dll+0x79788 reads through a pointer whose high
+  32 bits are gone (0x264d004c; the full value 0x70264d055c sits in x1).
+  CryEngine 2's 64-bit build relies on heap addresses below 4 GB, which
+  Windows' bottom-up allocation gives it; iOS reserves the whole low 4 GB as
+  __PAGEZERO, so no allocation can land there. Not fixable in the allocator;
+  32-bit Crysis is the route.
+* 32-bit Crysis (log 11:06): dies before any game code. aarch64 wow64.dll is
+  relocated off its preferred base, the loader binds its IAT (.rdata page
+  +0x33000), the read-only restore fails (`[vmem-denied] set_vprot failed
+  ... protect=0x2`), so NtProtectVirtualMemory's IAT sync into the JIT-pool
+  copy never runs; Wow64LdrpInitialize (+0x1b5fc) calls through the copy's
+  unbound slot = hint/name RVA 0x34f06. Build 242: a refused read-only restore
+  inside a pool-copied image leaves the page as it is, reports success and
+  lets the sync run ([vmem-denied] madeira-bcd: restore ... refused).
+* Build 241 on the device (logs 11:20, 11:21): the repatch works (16
+  [mach_exc] UNALIGNED-REPATCHED per run); one run got through the intro
+  videos (choppy) and stopped as the main menu appeared. Next fault, both
+  runs: `ldaddal w7, w8, [x6]` on 0x...b6267e (guest 0x1408df521, x86 lock
+  add/xadd on a misaligned dword), which only the LL/SC and CAS forms were
+  emulated for. Build 243: LSE atomics (LDADD/LDCLR/LDEOR/LDSET/LD{S,U}{MAX,MIN}
+  and SWP, any A/L) on a misaligned operand are emulated on the exception
+  server like CAS ([mach_exc] UNALIGNED-LSE). The owner's madeira.cfg still has
+  inproc-sync = 0 from the hang hunt (madsync off), a likely part of the
+  choppiness.
+* Build 243 (log 11:55, madsync back on): no unhandled fault at all; 11
+  [mach_exc] UNALIGNED-LSE (ldaddal) and 16 UNALIGNED-REPATCHED handled. The
+  game ran 55 s and was killed by jetsam: footprint 8178 of 8192 MB
+  (internal ~3.0 GB, compressed ~3.3 GB, external ~0.55 GB, swap tier 2.1 GB
+  file-backed). The pre-switch runs sat at the same edge (peaks 7687 and
+  7984 MB) and survived. Next: memory pool (mempool-mb, upstream's
+  MadeiraMemoryHost) and/or swap coverage "wide", one at a time.
+* 32-bit Crysis on build 243 (log 11:57): the IAT fix works (wow64.dll,
+  libwow64fex, ucrtbase, kernel32, kernelbase all bind; 20+ `[vmem-denied]
+  madeira-bcd: restore ... refused` lines), wow64 initialises and the game's
+  own code runs (creates C:\users\...\My Games\Crysis, LogBackups). Then
+  CPUID 0x80000002: FEX's Function_8000_0002h indexes PerCPUData with the raw
+  host CPU number (1 entry on iOS, CPU 3+) and strlen()s a garbage pointer
+  (0xfff68000; pc ntdll strlen, lr xtajit.dll Function_8000_0002h+0x30).
+  RunFunctionName wraps the index, the leaf entry points did not. Build 244:
+  tools/patch-fex-ios-cpuid-index.py for both modules; the WOW64 module
+  (xtajit.dll, until now built by hand with build/fex-wow64/build.sh) is now
+  built in CI by tools/build-xtajit-wow64.sh (cached FEX/build-wow64; the
+  committed module stays if the build fails or its exports differ).
+* 32-bit Crysis on build 244 (log 12:25): past CPUID; loads CryGame,
+  CrySystem, CryAction, d3dx9/d3dcompiler_43, CryInput, CrySoundSystem
+  (fmod), CryFont, CryAISystem, CryAnimation, Cry3DEngine, CryScriptSystem,
+  CryEntitySystem; 489 presents in the first 30 s; ran ~4 minutes compiling
+  shaders (d3dcompiler reflection fixmes). Then libwow64fex+0x11f644: the
+  TlsGetValue shim with x18 = 0 read TlsSlots[20] at 0x1520 -- the same
+  GetCurrentTEB() problem as GoW's on ARM64EC. Build 245 applies
+  tools/patch-fex-ios-teb-tsd.py to the WOW64 module too (its IosTebTsdOffset
+  is published into the same extern "C" variable).
+  (That build ran as run 246, e449b17; main fast-forwarded to it.)
+* Crysis intro videos, 30 s pause between each (same log, owner: "every gap
+  about a minute, the videos themselves smooth"): the gaps are exactly 30.0 s
+  of near-idle CPU (12:25:49.7 -> 12:26:19.7, 12:26:38.6 -> 12:27:08.5, ...).
+  The video thread (00b8, then 00dc) calls SuspendThread on ITSELF every frame
+  and is resumed by the main thread. On iOS a self-suspend never stops the
+  thread (SIGUSR1 never reaches usr1_handler, task #32), so it spun ~46k
+  SuspendThread/s and the server count sat at MAXIMUM_SUSPEND_COUNT
+  ([srv-suspend] "count 127->127"). When the video ended the thread reached
+  NtTerminateThread(self), whose zero-timeout server_select waits while the
+  thread is suspended -- forever (teb 0x7103090000 parked in
+  wait_select_reply for the rest of the log; no "read_request EOF" for 00b8
+  or 00dc), so the main thread sat out a 30 s join timeout. Build 247:
+  NtSuspendThread (build/ntdll-unix/thread_ios.c) waits like wait_suspend()
+  when the target is the calling thread ([self-suspend] log line).
+* Build 247 on device (log 2026-09-30 13:19 + screen recording): the intro
+  gaps are gone ([self-suspend] #1.. for tid 00b8) and Crysis reaches the
+  first level (beach, nanosuit boot HUD) at ~55 FPS, GPU ~5-6 ms, via
+  CryRenderD3D10 -> DXMT d3d11 (feature level 10_0). Rendering bug: parts of
+  the scene (nearby foliage, it looks like) are replaced by long vertical --
+  and some horizontal -- streaks spanning the screen, i.e. vertices thrown far
+  out (clip w near 0 or garbage) rather than a texture problem; rocks, beach,
+  trees at distance, weapon and HUD are fine. No DXMT warnings in the log.
+  There is no D3D11 capture tool yet (CAP sheets are madeira_d3d12 only).
+  Asked the owner to bisect with the in-game Advanced settings (all Low, then
+  raise Objects / Shaders / Game Effects one at a time) and to try the `-dx9`
+  launch argument (DXMT d3d9 path) for comparison.
+* Second recording (13:55): settings had been at Low; raised a notch, far
+  vegetation renders correctly and the broken shapes change: streaks radiate
+  from vanishing points (vertical toward zenith/nadir, horizontal toward the
+  horizon), so vertices of some nearby meshes are displaced very far in WORLD
+  space, not a screen-space pass. Reviewed and ruled out as obvious causes:
+  airconv vertex-format pulling (half/snorm/BGRA paths look right), wine's
+  d3dcompiler reflection (skips are STAT/signature padding; D3D10 GetDesc
+  maps to D3D10_SHADER_DESC). Open candidates, none proven: (1) constant
+  buffers bound smaller than the shader declares -- airconv loads cb[] with no
+  bounds and Metal has no robustness, so D3D's zero-fill becomes garbage
+  (a fix needs the declared size at encode time; MTL_SM50_SHADER_ARGUMENT is
+  also mirrored in research/madeira-d3d12/src/madeira_ir_abi.h, so do not
+  grow it without updating both); (2) 16-bit index buffer offsets that are
+  2 mod 4 (odd StartIndexLocation) passed straight to Metal. The -dx9
+  comparison is still pending.
+* -dx9 renders Crysis correctly (owner, 2026-09-30) but at ~28 FPS instead of
+  ~55-60 (the S25 Ultra runs it at ~110 FPS with DXVK 2.7.1), so the D3D10
+  path is the one to fix. Build 248: tools/patch-dxmt-cb-short.py parses each
+  shader's dcl_constantbuffer sizes (SHDR/SHEX, no airconv ABI change); a
+  bound buffer shorter than declared gets a zero-padded copy in the encoder's
+  argument buffer, refreshed every draw ([cb-short] lines), and 16-bit index
+  offsets that are not a multiple of 4 are counted ([idx-align], log only).
+  It only reaches 32-bit games: the i386 farm is rebuilt from research/dxmt,
+  the 64-bit PE d3d11.dll is still the committed binary. If [cb-short] never
+  appears, candidate (1) is refuted.
+* Performance (the -dx9 log 14:53 and the D3D10 log 13:19 alike): the main
+  thread 0024 ran 0 ms on P-cores and ~600 ms/s on E-cores (2.1-2.6 GHz),
+  [cpu-split] 88-97 % x64 JIT, while the game's time-critical thread (0060)
+  ran on P-cores at 4.2 GHz. wineserver's apply_thread_priority (__APPLE__
+  branch of wine/server/thread.c) sets Mach precedence/throughput/latency
+  policies from the Windows priority at thread start; for NORMAL threads that
+  appears to override the USER_INTERACTIVE QoS the guest threads ask for.
+  Build 249: tools/patch-wine-thread-qos.py skips those policies below the
+  realtime band on WINE_IOS ([thread-prio] lines;
+  MADEIRA_WIN_THREAD_PRIORITY=1 restores them). Check [xp-t] for 0024's P ms.
+  The owner also has the in-game 60 FPS cap on; to be turned off for the test.
+* Build 249 on device (log 15:46, 60 FPS cap off): ~92 FPS, GPU ~4 ms; the
+  streaks remain, and the owner saw that they only appear where trees or
+  branches are in view (rocks, sea, sky fine). [cb-short] fired (cb0 80/74,
+  cb1 9/4..42, cb2 4/3 vec4 and more), so short constant buffers were real but
+  not the cause; [idx-align] counted 659456 16-bit draws with offset 2 mod 4.
+  [thread-prio] showed Crysis's main thread toggling base 0/15 and the policies
+  skipped, yet 0024 still ran 0 ms on P-cores. Root cause of that: the guest
+  main thread is created in WineProcessBridge.m with
+  pthread_attr_setschedparam(priority 20), a fixed priority, so Darwin refuses
+  pthread_set_qos_class_self_np (EPERM) -- USER_INTERACTIVE and the ECO switch
+  never applied to it. Build 250: the thread gets its QoS through
+  pthread_attr_set_qos_class_np instead ([main-qos] line), and
+  tools/patch-dxmt-idx-align.py copies misaligned 16-bit index ranges to a
+  4-byte aligned place in the argument buffer (MADEIRA_IDX_REALIGN=0 = off).
+  The ECO toggle is in the session menu (Battery saver (ECO)) and the ECO pill
+  of the Madeira performance overlay, not in Apple's Metal HUD.
+* Upstream merge 2026-09-30 (100 commits up to fdbdef7, "round 3"): Steam
+  owned library (sign-in, downloads, installs), fastsync as the DEFAULT sync
+  engine (madsync only with inproc-sync = 1; Settings > Sync engine), NSI
+  network tables and dnsapi unixlib, Dock GDI table for 32-bit programs, touch
+  control glass faces, rebuilt 64-bit/aarch64 DLLs; pins FEX 26859e1 (#5:
+  CPUID table bound -- tools/patch-fex-ios-cpuid-index.py now detects it and
+  does nothing), wine 4f5b197, madeira-dock 3cadfbe. Kept ours: game cfg
+  env block before the fastsync default (a game's env.MADEIRA_FASTSYNC wins),
+  pointerMax, the JIT-pool second-session guard, the controls opacity, the
+  memory-pool picker and MemoryHostTest row. The session menu's ECO toggle
+  moved from Display to its own CPU section (the owner looked for it there).
+* Build 251 on device (log 16:37): [main-qos] rc=0 class 0x21 -- the guest
+  main thread now runs on P-cores (0024 ~300 ms P per 300 ms), so that fix
+  works. The tree streaks are unchanged, but neither DXMT fix had actually
+  run for most draws: both skipped GpuManaged allocations, and Crysis's
+  static buffers are GpuManaged (578 of 653 buffers, [mem-census]). On iOS a
+  GpuManaged buffer is CpuPlaced and Managed does not exist, so the CPU
+  mapping IS the storage; the next build copies from it too and logs
+  "encode: realigned / zero-padded copy bound / skipped" counts. The session
+  menu the owner uses in a game is LibraryHUD's (Library.swift), not
+  SessionUI's: the ECO toggle now also sits there under a CPU heading.
+* Build 254 (7fe376d, first build of the round-3 merge) FAILED at "Verify all
+  linked archives exist": libntdll_unix.a was not built because upstream's new
+  nsi_ndis_ios.c / nsi_ip_ios.c did not compile -- RTM_IFINFO, RTA_IFP and
+  RTF_LLINFO undeclared. Our CI configures Wine against the iPhoneOS SDK
+  (no <net/route.h>), so HAVE_NET_ROUTE_H is undefined and ndis.c/ip.c never
+  include upstream's shims/net/route.h (upstream builds with a macOS-configured
+  config.h). Fix: both wrappers define HAVE_NET_ROUTE_H when config.h does
+  not. (How the error was found: the job log is only 2649 lines; get_job_logs
+  with tail_lines=2649 saves it to a file that can be grepped.)
 
 ### Build 226: first green IPA after the switch (2026-09-29, run 36595079405)
 Commit 17088ab (main fast-forwarded; the automatic main run 227 cancelled).
